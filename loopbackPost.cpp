@@ -210,7 +210,7 @@ static std::wstring BuildAudioUrl(const std::wstring& originalUrl,
     return result;
 }
 
-static bool WriteAll(HINTERNET request,
+static bool WriteRaw(HINTERNET request,
                      const BYTE* data,
                      DWORD bytes)
 {
@@ -237,6 +237,58 @@ static bool WriteAll(HINTERNET request,
     }
 
     return true;
+}
+
+static bool WriteChunk(HINTERNET request,
+                       const BYTE* data,
+                       DWORD bytes)
+{
+    char header[32];
+
+    const int headerLen =
+        sprintf_s(
+            header,
+            sizeof(header),
+            "%lX\r\n",
+            static_cast<unsigned long>(bytes));
+
+    if (headerLen <= 0)
+        return false;
+
+    // chunk size
+    if (!WriteRaw(
+            request,
+            reinterpret_cast<const BYTE*>(header),
+            static_cast<DWORD>(headerLen))) {
+        return false;
+    }
+
+    // chunk data
+    if (bytes > 0) {
+        if (!WriteRaw(request, data, bytes))
+            return false;
+    }
+
+    // trailing CRLF
+    static const BYTE crlf[] = {'\r', '\n'};
+
+    if (!WriteRaw(request, crlf, 2))
+        return false;
+
+    return true;
+}
+
+static bool EndChunkedRequest(HINTERNET request)
+{
+    static const BYTE end[] = {
+        '0', '\r', '\n',
+        '\r', '\n'
+    };
+
+    return WriteRaw(
+        request,
+        end,
+        sizeof(end));
 }
 
 static int16_t FloatToS16(float value)
@@ -776,7 +828,7 @@ int wmain(int argc, wchar_t* argv[])
                                 static_cast<DWORD>(
                                     sizeof(zeroBuffer)));
 
-                        if (!WriteAll(
+                        if (!WriteChunk(
                                 request,
                                 zeroBuffer,
                                 chunk)) {
@@ -800,7 +852,7 @@ int wmain(int argc, wchar_t* argv[])
                             << L"PCM conversion failed.\n";
                         ok = false;
                     } else {
-                        if (!WriteAll(
+                        if (!WriteChunk(
                                 request,
                                 reinterpret_cast<
                                     const BYTE*>(
@@ -834,15 +886,9 @@ int wmain(int argc, wchar_t* argv[])
         // 结束 chunked request
         DWORD ignored = 0;
 
-        if (!WinHttpWriteData(
-                request,
-                nullptr,
-                0,
-                &ignored)) {
-
+        if (!EndChunkedRequest(request)) {
             if (ok)
-                PrintWinError(
-                    L"WinHttpWriteData(end chunk)");
+                PrintWinError(L"EndChunkedRequest");
         }
 
         if (request) {
