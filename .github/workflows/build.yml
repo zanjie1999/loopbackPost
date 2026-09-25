@@ -20,7 +20,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cl /nologo /EHsc /std:c++17 /O2 /MT loopback_upload.cpp /Fe:loopback_upload.exe /link winhttp.lib ole32.lib uuid.lib
+          cl /nologo /EHsc /std:c++17 /O2 /MT loopbackPost.cpp /Fe:loopbackPost.exe /link winhttp.lib ole32.lib uuid.lib
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
