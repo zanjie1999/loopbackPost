@@ -72,9 +72,10 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
         return false;
     }
 
-    out.host.assign(url.data() + uc.dwHostNameOffset, uc.dwHostNameLength);
-    out.path.assign(url.data() + uc.dwUrlPathOffset,
-                    uc.dwUrlPathLength + uc.dwExtraInfoLength);
+    out.host.assign(uc.lpszHostName, uc.dwHostNameLength);
+    out.path.assign(uc.lpszUrlPath ? uc.lpszUrlPath : L"", uc.dwUrlPathLength);
+    if (uc.lpszExtraInfo && uc.dwExtraInfoLength)
+        out.path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     return true;
 }
 
@@ -432,7 +433,7 @@ int wmain(int argc, wchar_t* argv[])
             if (WinHttpReceiveResponse(request, nullptr)) {
                 DWORD status = 0;
                 DWORD statusSize = sizeof(status);
-                if (WinHttpQueryHeadersW(
+                if (WinHttpQueryHeaders(
                         request,
                         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         WINHTTP_HEADER_NAME_BY_INDEX,
