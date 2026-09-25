@@ -201,7 +201,7 @@ int wmain(int argc, wchar_t* argv[])
     if (argc >= 2) {
         url = argv[1];
     } else {
-        std::wcout << L"workdayAlarmClockGo URL: ";
+        std::wcout << L"workdayAlarmClockGo URL end with /aplay: ";
         std::getline(std::wcin, url);
     }
 
@@ -332,7 +332,7 @@ int wmain(int argc, wchar_t* argv[])
         const wchar_t headers[] =
             L"Content-Type: application/octet-stream\r\n"
             L"Transfer-Encoding: chunked\r\n"
-            L"Expect:\r\n";
+            L"Expect: 100-continue\r\n";
 
         if (!WinHttpSendRequest(
                 request,
