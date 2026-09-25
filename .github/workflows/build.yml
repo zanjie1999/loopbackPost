@@ -1,0 +1,25 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /EHsc /std:c++17 /O2 /MT loopbackPost.cpp /Fe:loopbackPost.exe /link winhttp.lib ole32.lib uuid.lib
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: loopbackPost-windows-x64
+          path: loopbackPost.exe

@@ -1,0 +1,4 @@
+# 工作咩闹钟的Windows实时音频推送上位机
+用于工作咩闹钟Linux端接收Windows电脑的实时播放的音频
+
+给电脑当音箱用,类似mac上的AirPlay
