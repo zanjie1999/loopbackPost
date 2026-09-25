@@ -59,6 +59,20 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
 
+    // 给 WinHttpCrackUrl 提供实际的输出缓冲区。
+    wchar_t host[512] = {};
+    wchar_t path[4096] = {};
+    wchar_t extra[4096] = {};
+
+    uc.lpszHostName = host;
+    uc.dwHostNameLength = _countof(host);
+
+    uc.lpszUrlPath = path;
+    uc.dwUrlPathLength = _countof(path);
+
+    uc.lpszExtraInfo = extra;
+    uc.dwExtraInfoLength = _countof(extra);
+
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
         PrintWinError(L"WinHttpCrackUrl");
         return false;
@@ -67,15 +81,23 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     out.https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
     out.port = uc.nPort;
 
-    if (uc.dwHostNameLength == 0 || uc.dwUrlPathLength + uc.dwExtraInfoLength == 0) {
-        std::wcerr << L"Invalid URL.\n";
+    if (uc.dwHostNameLength == 0) {
+        std::wcerr << L"Invalid URL: missing host.\n";
         return false;
     }
 
-    out.host.assign(uc.lpszHostName, uc.dwHostNameLength);
-    out.path.assign(uc.lpszUrlPath ? uc.lpszUrlPath : L"", uc.dwUrlPathLength);
-    if (uc.lpszExtraInfo && uc.dwExtraInfoLength)
-        out.path.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
+    out.host.assign(host, uc.dwHostNameLength);
+
+    // 没有路径时使用 /
+    if (uc.dwUrlPathLength > 0)
+        out.path.assign(path, uc.dwUrlPathLength);
+    else
+        out.path = L"/";
+
+    // ?query / #fragment
+    if (uc.dwExtraInfoLength > 0)
+        out.path.append(extra, uc.dwExtraInfoLength);
+
     return true;
 }
 
@@ -179,12 +201,12 @@ int wmain(int argc, wchar_t* argv[])
     if (argc >= 2) {
         url = argv[1];
     } else {
-        std::wcout << L"输入接收音频的workdayAlarmClockGo服务端URL,比如http://192.168.1.147:8080/aplay\n请输入URL: ";
+        std::wcout << L"workdayAlarmClockGo URL: ";
         std::getline(std::wcin, url);
     }
 
     if (url.empty()) {
-        std::wcerr << L"No URL输入的不是URL\n";
+        std::wcerr << L"No URL.\n";
         return 1;
     }
 
