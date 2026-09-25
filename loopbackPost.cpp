@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <conio.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <ksmedia.h>
@@ -655,68 +656,40 @@ int wmain(int argc, wchar_t* argv[])
             << finalUrl
             << L"\n";
 
-        session = WinHttpOpen(
-            L"workdayAlarmClockGo/1.0",
-            WINHTTP_ACCESS_TYPE_NO_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS,
-            0);
+        const auto closeHttp = [&]() {
+            if (request) { WinHttpCloseHandle(request); request = nullptr; }
+            if (connect) { WinHttpCloseHandle(connect); connect = nullptr; }
+            if (session) { WinHttpCloseHandle(session); session = nullptr; }
+        };
 
-        if (!session) {
-            PrintWinError(L"WinHttpOpen");
-            break;
-        }
-
-        WinHttpSetTimeouts(
-            session,
-            5000,
-            5000,
-            10000,
-            10000);
-
-        connect = WinHttpConnect(
-            session,
-            finalParts.host.c_str(),
-            finalParts.port,
-            0);
-
-        if (!connect) {
-            PrintWinError(L"WinHttpConnect");
-            break;
-        }
-
-        request = WinHttpOpenRequest(
-            connect,
-            L"PUT",
-            finalParts.path.c_str(),
-            nullptr,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            finalParts.https
-                ? WINHTTP_FLAG_SECURE
-                : 0);
-
-        if (!request) {
-            PrintWinError(L"WinHttpOpenRequest");
-            break;
-        }
-
-        const wchar_t headers[] =
-            L"Content-Type: application/octet-stream\r\n"
-            L"Transfer-Encoding: chunked\r\n"
-            L"Expect: 100-continue\r\n";
-
-        if (!WinHttpSendRequest(
-                request,
-                headers,
-                static_cast<DWORD>(-1),
-                WINHTTP_NO_REQUEST_DATA,
-                0,
-                WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
-                0)) {
-            PrintWinError(L"WinHttpSendRequest");
-            break;
-        }
+        const auto openHttp = [&]() -> bool {
+            closeHttp();
+            session = WinHttpOpen(
+                L"workdayAlarmClockGo/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+            if (!session) { PrintWinError(L"WinHttpOpen"); return false; }
+            WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
+            connect = WinHttpConnect(session, finalParts.host.c_str(), finalParts.port, 0);
+            if (!connect) { PrintWinError(L"WinHttpConnect"); closeHttp(); return false; }
+            request = WinHttpOpenRequest(
+                connect, L"PUT", finalParts.path.c_str(), nullptr,
+                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                finalParts.https ? WINHTTP_FLAG_SECURE : 0);
+            if (!request) { PrintWinError(L"WinHttpOpenRequest"); closeHttp(); return false; }
+            const wchar_t headers[] =
+                L"Content-Type: application/octet-stream\r\n"
+                L"Transfer-Encoding: chunked\r\n"
+                L"Expect: 100-continue\r\n";
+            if (!WinHttpSendRequest(
+                    request, headers, static_cast<DWORD>(-1),
+                    WINHTTP_NO_REQUEST_DATA, 0,
+                    WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH, 0)) {
+                PrintWinError(L"WinHttpSendRequest");
+                closeHttp();
+                return false;
+            }
+            return true;
+        };
 
         constexpr REFERENCE_TIME bufferDuration =
             1000000; // 100 ms
@@ -755,13 +728,43 @@ int wmain(int argc, wchar_t* argv[])
         }
 
         std::wcout
-            << L"Press Ctrl+C to stop.\n";
+            << L"Press Enter to reconnect, Ctrl+C to stop.\n";
 
         ok = true;
 
         std::vector<int16_t> pcm16;
 
+        bool connected = false;
+        bool retryAfterDelay = false;
+
         while (!g_stop.load()) {
+            if (!connected) {
+                if (retryAfterDelay)
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                if (g_stop.load())
+                    break;
+                std::wcout << L"Connecting...\n";
+                connected = openHttp();
+                retryAfterDelay = false;
+                if (!connected) {
+                    std::wcerr << L"Reconnect failed. Press Enter to retry.\n";
+                    while (!g_stop.load()) {
+                        if (_kbhit() && _getch() == '\r')
+                            break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    continue;
+                }
+                std::wcout << L"Connected.\n";
+            }
+
+            if (_kbhit() && _getch() == '\r') {
+                std::wcout << L"Reconnect requested.\n";
+                connected = false;
+                closeHttp();
+                continue;
+            }
+
             UINT32 packetFrames = 0;
 
             hr = captureClient->GetNextPacketSize(
@@ -771,7 +774,7 @@ int wmain(int argc, wchar_t* argv[])
                 PrintHr(
                     L"IAudioCaptureClient::GetNextPacketSize",
                     hr);
-                ok = false;
+                connected = false;
                 break;
             }
 
@@ -800,7 +803,7 @@ int wmain(int argc, wchar_t* argv[])
                     PrintHr(
                         L"IAudioCaptureClient::GetBuffer",
                         hr);
-                    ok = false;
+                    connected = false;
                     break;
                 }
 
@@ -832,7 +835,7 @@ int wmain(int argc, wchar_t* argv[])
                                 request,
                                 zeroBuffer,
                                 chunk)) {
-                            ok = false;
+                            connected = false;
                             break;
                         }
 
@@ -850,7 +853,7 @@ int wmain(int argc, wchar_t* argv[])
                             pcm16)) {
                         std::wcerr
                             << L"PCM conversion failed.\n";
-                        ok = false;
+                        connected = false;
                     } else {
                         if (!WriteChunk(
                                 request,
@@ -858,14 +861,14 @@ int wmain(int argc, wchar_t* argv[])
                                     const BYTE*>(
                                     pcm16.data()),
                                 outputBytes)) {
-                            ok = false;
+                            connected = false;
                         }
                     }
                 }
 
                 captureClient->ReleaseBuffer(frames);
 
-                if (!ok || g_stop.load())
+                if (!connected || g_stop.load())
                     break;
 
                 hr = captureClient->GetNextPacketSize(
@@ -875,23 +878,23 @@ int wmain(int argc, wchar_t* argv[])
                     PrintHr(
                         L"IAudioCaptureClient::GetNextPacketSize",
                         hr);
-                    ok = false;
+                    connected = false;
                     break;
                 }
+            }
+
+            if (!connected && !g_stop.load()) {
+                std::wcerr << L"Connection interrupted; retrying in 1 second.\n";
+                closeHttp();
+                retryAfterDelay = true;
             }
         }
 
         audioClient->Stop();
 
         // 结束 chunked request
-        DWORD ignored = 0;
-
-        if (!EndChunkedRequest(request)) {
-            if (ok)
-                PrintWinError(L"EndChunkedRequest");
-        }
-
-        if (request) {
+        if (connected && request) {
+            EndChunkedRequest(request);
             if (WinHttpReceiveResponse(
                     request,
                     nullptr)) {
@@ -916,6 +919,8 @@ int wmain(int argc, wchar_t* argv[])
                 }
             }
         }
+
+        closeHttp();
 
     } while (false);
 
