@@ -34,14 +34,14 @@ static constexpr double kBlockedWriteMs = 5.0;
 static double g_blockedMs = 0.0;
 
 // 累计值超过这个阈值就触发重连
-static constexpr double kReconnectBlockedMs = 100.0;
+static constexpr double kReconnectBlockedMs = 120.0;
 
 // 两次拥塞重连之间的冷却，避免网络持续抖动时疯狂重连
 static constexpr auto kCongestionCooldown = std::chrono::seconds(3);
 
 // 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
 static constexpr auto kCongestionReconnectDelay =
-    std::chrono::milliseconds(250);
+    std::chrono::milliseconds(200);
 
 BOOL WINAPI ConsoleHandler(DWORD type)
 {
@@ -742,7 +742,7 @@ int wmain(int argc, wchar_t* argv[])
 
         // 重连时只 Stop + Reset，不要在这里 Start。
         // 这样在等待网络/服务端恢复的这段时间里，WASAPI 不会继续产生
-        // 捕获数据，避免 150 ms（或普通重连等待期间）产生新的积压。
+        // 捕获数据，避免 200 ms（或普通重连等待期间）产生新的积压。
         const auto stopAndFlushAudioCapture = [&]() -> bool {
             if (!audioClient)
                 return false;
@@ -1005,7 +1005,7 @@ int wmain(int argc, wchar_t* argv[])
 
         bool connected = false;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
-        bool shortReconnectDelay = false; // 手动/拥塞：等待 150 ms
+        bool shortReconnectDelay = false; // 手动/拥塞：等待 200 ms
         bool congested = false;       // 用于输出拥塞重连日志
 
         auto lastCongestion =
@@ -1016,7 +1016,7 @@ int wmain(int argc, wchar_t* argv[])
                 if (retryAfterDelay) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 } else if (shortReconnectDelay) {
-                    // 150 ms 等待期间采集已经 Stop+Reset，因此不会产生新的音频积压。
+                    // 200 ms 等待期间采集已经 Stop+Reset，因此不会产生新的音频积压。
                     std::this_thread::sleep_for(kCongestionReconnectDelay);
                 }
 
@@ -1053,7 +1053,7 @@ int wmain(int argc, wchar_t* argv[])
 
                     while (!g_stop.load()) {
                         if (_kbhit() && _getch() == '\r') {
-                            // 用户主动重试也统一走 150 ms 的静音窗口，
+                            // 用户主动重试也统一走 200 ms 的静音窗口，
                             // 之后重新获取默认输出设备再建立连接。
                             shortReconnectDelay = true;
                             break;
@@ -1088,8 +1088,8 @@ int wmain(int argc, wchar_t* argv[])
                 shortReconnectDelay = true;
                 congested = false;
 
-                // 立刻 Stop+Reset 清掉当前捕获积压，然后等 150 ms。
-                // 这 150 ms 内采集保持停止，绝不会继续往 WASAPI buffer 里堆数据。
+                // 立刻 Stop+Reset 清掉当前捕获积压，然后等 200 ms。
+                // 这 200 ms 内采集保持停止，绝不会继续往 WASAPI buffer 里堆数据。
                 if (!stopAndFlushAudioCapture()) {
                     std::wcerr
                         << L"Failed to flush audio capture; will rebuild it during reconnect.\n";
@@ -1253,7 +1253,7 @@ int wmain(int argc, wchar_t* argv[])
 
                 if (congested) {
                     std::wcerr
-                        << L"Congestion reconnect; capture stopped, flushing buffers, waiting 150 ms.\n";
+                        << L"Congestion reconnect; capture stopped, flushing buffers, waiting 200 ms.\n";
                     retryAfterDelay = false;
                     shortReconnectDelay = true;
                 } else {
