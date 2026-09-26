@@ -1106,7 +1106,8 @@ int wmain(int argc, wchar_t* argv[])
         const bool serviceMode = (argc >= 2);
 
         bool connected = false;
-        bool streamConfirmed = false; // 至少成功写出过一块音频数据
+        bool streamConfirmed = false; // 已持续成功写出多块音频数据
+        int successfulChunks = 0;
         int autoReconnectAttempts = 0;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
         bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
@@ -1196,8 +1197,9 @@ int wmain(int argc, wchar_t* argv[])
 
                 g_blockedMs = 0.0;
                 streamConfirmed = false;
+                successfulChunks = 0;
                 std::wcout
-                    << L"HTTP connected; waiting for first audio write...\n";
+                    << L"HTTP connected; waiting for audio writes...\n";
             }
 
             if (_kbhit() && _getch() == '\r') {
@@ -1205,6 +1207,7 @@ int wmain(int argc, wchar_t* argv[])
                 closeHttp();
                 connected = false;
                 streamConfirmed = false;
+                successfulChunks = 0;
                 autoReconnectAttempts = 0;
                 retryAfterDelay = false;
                 serviceRetryDelay = false;
@@ -1304,7 +1307,8 @@ int wmain(int argc, wchar_t* argv[])
                             break;
                         }
 
-                        if (!streamConfirmed) {
+                        ++successfulChunks;
+                        if (!streamConfirmed && successfulChunks >= 3) {
                             streamConfirmed = true;
                             autoReconnectAttempts = 0;
                             serviceRetryDelay = false;
@@ -1339,7 +1343,8 @@ int wmain(int argc, wchar_t* argv[])
                                     pcm16.data()),
                                 outputBytes)) {
                             connected = false;
-                        } else if (!streamConfirmed) {
+                        } else ++successfulChunks;
+                        if (!streamConfirmed && successfulChunks >= 3) {
                             streamConfirmed = true;
                             autoReconnectAttempts = 0;
                             serviceRetryDelay = false;
