@@ -1,6 +1,7 @@
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <windows.h>
 #include <conio.h>
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -37,10 +39,16 @@ static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 // 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
 static constexpr double kDropBacklogMs = 60.0;
 
-// 拥塞补偿固定按 20 ms 一轮连续丢弃。
-// 例如累计欠账 163 ms，就连续丢 8 个完整的 20 ms 轮次，最后再丢 3 ms，
-// 中间不插入保留音频，直到待补偿延迟清零。
-static constexpr double kDropUnitMs = 20.0;
+// 拥塞补偿以 5 ms 为最小操作单位。
+// 不是连续“吃掉”缓存，而是在收到拥塞事件时预先计算一张
+// “发送/丢弃”时间轴；后续每个 WASAPI packet 只按时间轴执行。
+static constexpr double kDropUnitMs = 5.0;
+static constexpr double kInitialCongestionIntervalMs = 1000.0;
+static constexpr double kMinCongestionIntervalMs = 100.0;
+static constexpr double kMaxRecoveryIntervalMs = 1000.0;
+// 延迟已经非常大时，直接把旧数据全部丢掉，避免用户长时间听到快进/跳跃。
+static constexpr double kDropAllBacklogMs = 2000.0;
+static constexpr double kCongestionIntervalEwmaAlpha = 0.35;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -1117,9 +1125,151 @@ int wmain(int argc, wchar_t* argv[])
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
         bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
         bool shortReconnectDelay = false; // 手动重连：等待 200 ms
-        // 需要通过连续 20 ms 轮次丢掉的旧音频帧总量。
+        // 当前还需要从历史音频中跳过的旧帧总量。
         uint64_t dropFrames = 0;
         bool dropBacklogActive = false;
+
+        struct CompensationSegment {
+            bool drop = false;
+            uint64_t frames = 0;
+        };
+        // 拥塞发生时预先算好的“发送/丢弃”时间轴。
+        std::deque<CompensationSegment> compensationSchedule;
+
+        // 最近一次进入拥塞累计的时间，用于估算平均拥塞间隔。
+        bool haveLastCongestionTime = false;
+        auto lastCongestionTime = std::chrono::steady_clock::now();
+        double avgCongestionIntervalMs = kInitialCongestionIntervalMs;
+        const auto clearCompensation = [&]() {
+            dropFrames = 0;
+            dropBacklogActive = false;
+            compensationSchedule.clear();
+        };
+
+        const auto buildCompensationSchedule = [&]() {
+            compensationSchedule.clear();
+
+            if (dropFrames == 0)
+                return;
+
+            const uint64_t unitFrames = std::max<uint64_t>(
+                1,
+                static_cast<uint64_t>(
+                    static_cast<double>(format->nSamplesPerSec) *
+                    kDropUnitMs / 1000.0));
+
+            const double backlogMs =
+                static_cast<double>(dropFrames) * 1000.0 /
+                static_cast<double>(format->nSamplesPerSec);
+
+            // 欠账太大，直接清掉所有历史音频。
+            if (backlogMs >= kDropAllBacklogMs) {
+                compensationSchedule.push_back({true, dropFrames});
+                return;
+            }
+
+            // 希望在最近几次拥塞的平均间隔内把欠账追回。
+            // 假设恢复窗口为 R，那么需要处理 B+R 的源音频，其中 B 为丢弃量，
+            // R 为实际继续播放的音频量，因此丢弃比例 = B / (B + R)。
+            const double recoveryMs =
+                std::max(
+                    kMinCongestionIntervalMs,
+                    std::min(
+                        kMaxRecoveryIntervalMs,
+                        avgCongestionIntervalMs));
+
+            uint64_t sendFrames = static_cast<uint64_t>(
+                static_cast<double>(format->nSamplesPerSec) *
+                recoveryMs / 1000.0);
+
+            if (sendFrames == 0)
+                sendFrames = unitFrames;
+
+            const uint64_t dropUnits = dropFrames / unitFrames;
+            const uint64_t dropRemainder = dropFrames % unitFrames;
+            const uint64_t sendUnits = sendFrames / unitFrames;
+            const uint64_t sendRemainder = sendFrames % unitFrames;
+
+            const uint64_t totalActions =
+                dropUnits + (dropRemainder ? 1 : 0) +
+                sendUnits + (sendRemainder ? 1 : 0);
+
+            if (totalActions == 0)
+                return;
+
+            // 用 Bresenham/DDA 的方式把“丢”动作均匀撒进“发”动作之间。
+            // 这里先计算完整时间轴，再执行时间轴；不修改 WASAPI 的缓存内容。
+            // 典型结果类似：发10ms、丢5ms、发10ms、丢5ms……
+            const uint64_t totalDropActions =
+                dropUnits + (dropRemainder ? 1 : 0);
+            const uint64_t totalSendActions =
+                sendUnits + (sendRemainder ? 1 : 0);
+
+            uint64_t dropIndex = 0;
+            uint64_t sendIndex = 0;
+            uint64_t previousDropCount = 0;
+            uint64_t previousSendCount = 0;
+
+            for (uint64_t i = 1; i <= totalActions; ++i) {
+                const uint64_t targetDropCount =
+                    (i * totalDropActions) / totalActions;
+                const uint64_t targetSendCount =
+                    (i * totalSendActions) / totalActions;
+
+                if (targetDropCount > previousDropCount) {
+                    while (dropIndex < targetDropCount) {
+                        uint64_t framesForAction = unitFrames;
+                        if (dropIndex + 1 == totalDropActions && dropRemainder)
+                            framesForAction = dropRemainder;
+
+                        if (!compensationSchedule.empty() &&
+                            compensationSchedule.back().drop) {
+                            compensationSchedule.back().frames += framesForAction;
+                        } else {
+                            compensationSchedule.push_back({true, framesForAction});
+                        }
+                        ++dropIndex;
+                    }
+                }
+
+                if (targetSendCount > previousSendCount) {
+                    while (sendIndex < targetSendCount) {
+                        uint64_t framesForAction = unitFrames;
+                        if (sendIndex + 1 == totalSendActions && sendRemainder)
+                            framesForAction = sendRemainder;
+
+                        if (!compensationSchedule.empty() &&
+                            !compensationSchedule.back().drop) {
+                            compensationSchedule.back().frames += framesForAction;
+                        } else {
+                            compensationSchedule.push_back({false, framesForAction});
+                        }
+                        ++sendIndex;
+                    }
+                }
+
+                previousDropCount = targetDropCount;
+                previousSendCount = targetSendCount;
+            }
+
+            // 理论上所有动作都已经排入。若由于整数取整导致个别动作没有排入，
+            // 这里补到末尾，保证欠账一定能被完全消耗。
+            while (dropIndex < totalDropActions) {
+                uint64_t framesForAction = unitFrames;
+                if (dropIndex + 1 == totalDropActions && dropRemainder)
+                    framesForAction = dropRemainder;
+                compensationSchedule.push_back({true, framesForAction});
+                ++dropIndex;
+            }
+
+            while (sendIndex < totalSendActions) {
+                uint64_t framesForAction = unitFrames;
+                if (sendIndex + 1 == totalSendActions && sendRemainder)
+                    framesForAction = sendRemainder;
+                compensationSchedule.push_back({false, framesForAction});
+                ++sendIndex;
+            }
+        };
 
         while (!g_stop.load()) {
             if (!connected) {
@@ -1204,8 +1354,9 @@ int wmain(int argc, wchar_t* argv[])
                 g_blockedMs = 0.0;
                 streamConfirmed = false;
                 successfulChunks = 0;
-                dropFrames = 0;
-                dropBacklogActive = false;
+                clearCompensation();
+                haveLastCongestionTime = false;
+                avgCongestionIntervalMs = kInitialCongestionIntervalMs;
                 std::wcout
                     << L"HTTP connected; waiting for audio writes...\n";
             }
@@ -1220,8 +1371,9 @@ int wmain(int argc, wchar_t* argv[])
                 retryAfterDelay = false;
                 serviceRetryDelay = false;
                 shortReconnectDelay = true;
-                dropFrames = 0;
-                dropBacklogActive = false;
+                clearCompensation();
+                haveLastCongestionTime = false;
+                avgCongestionIntervalMs = kInitialCongestionIntervalMs;
 
                 // 立刻 Stop+Reset 清掉当前捕获积压，然后等 200 ms。
                 // 这 200 ms 内采集保持停止，绝不会继续往 WASAPI buffer 里堆数据。
@@ -1230,8 +1382,9 @@ int wmain(int argc, wchar_t* argv[])
                         << L"Failed to flush audio capture; will rebuild it during reconnect.\n";
                 }
 
-                dropFrames = 0;
-                dropBacklogActive = false;
+                clearCompensation();
+                haveLastCongestionTime = false;
+                avgCongestionIntervalMs = kInitialCongestionIntervalMs;
                 g_blockedMs = 0.0;
                 continue;
             }
@@ -1278,39 +1431,110 @@ int wmain(int argc, wchar_t* argv[])
                     break;
                 }
 
-                // 如果前一次网络写入严重阻塞，WASAPI 会在这段时间继续积累历史音频。
-                // 固定按 20 ms 一轮连续丢弃：先计算需要多少轮，再连续执行，直到 dropFrames == 0。
+                // 不修改 WASAPI 缓存本身。先根据当前欠账生成“发送/丢弃”计划，
+                // 然后对当前 packet 逐段执行：该发送的就发送，该丢的只推进 frameOffset。
                 UINT32 frameOffset = 0;
-                const uint64_t dropUnitFrames = std::max<uint64_t>(
-                    1,
-                    static_cast<uint64_t>(
-                        static_cast<double>(format->nSamplesPerSec) *
-                        kDropUnitMs / 1000.0));
+
+                if (dropFrames > 0 && compensationSchedule.empty())
+                    buildCompensationSchedule();
 
                 while (frameOffset < frames && connected && !g_stop.load()) {
                     const UINT32 framesLeft = frames - frameOffset;
 
-                    if (dropFrames > 0) {
-                        const uint64_t skip64 =
+                    if (!compensationSchedule.empty()) {
+                        CompensationSegment& segment = compensationSchedule.front();
+                        const UINT32 segmentFrames = static_cast<UINT32>(
                             std::min<uint64_t>(
-                                dropFrames,
-                                std::min<uint64_t>(
-                                    static_cast<uint64_t>(framesLeft),
-                                    dropUnitFrames));
-                        const UINT32 skipFrames = static_cast<UINT32>(skip64);
+                                segment.frames,
+                                static_cast<uint64_t>(framesLeft)));
 
-                        frameOffset += skipFrames;
-                        dropFrames -= skipFrames;
+                        if (segment.drop) {
+                            frameOffset += segmentFrames;
+                            dropFrames -= segmentFrames;
+                        } else {
+                            const size_t sampleCount =
+                                static_cast<size_t>(segmentFrames) * format->nChannels;
+                            const DWORD outputBytes =
+                                static_cast<DWORD>(sampleCount * sizeof(int16_t));
+                            const BYTE* segmentData =
+                                (data != nullptr)
+                                    ? data + static_cast<size_t>(frameOffset) * format->nBlockAlign
+                                    : nullptr;
 
-                        if (skipFrames > 0 && dropFrames == 0 && dropBacklogActive) {
-                            std::wcout << L"Drop backlog cleared.\n";
-                            dropBacklogActive = false;
+                            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                                static BYTE zeroBuffer[64 * 1024]{};
+                                DWORD left = outputBytes;
+
+                                while (left > 0 && !g_stop.load()) {
+                                    DWORD chunk =
+                                        (left < static_cast<DWORD>(sizeof(zeroBuffer)))
+                                            ? left
+                                            : static_cast<DWORD>(sizeof(zeroBuffer));
+
+                                    if (!WriteChunk(request, zeroBuffer, chunk)) {
+                                        connected = false;
+                                        break;
+                                    }
+
+                                    ++successfulChunks;
+                                    if (!streamConfirmed && successfulChunks >= 3) {
+                                        streamConfirmed = true;
+                                        autoReconnectAttempts = 0;
+                                        serviceRetryDelay = false;
+                                        retryAfterDelay = false;
+                                        std::wcout << L"Connected. Audio data flowing.\n";
+                                    }
+
+                                    left -= chunk;
+                                }
+                            } else if (segmentData != nullptr && segmentFrames > 0) {
+                                if (!ConvertToS16(
+                                        segmentData,
+                                        segmentFrames,
+                                        format,
+                                        sampleType,
+                                        pcm16)) {
+                                    std::wcerr << L"PCM conversion failed.\n";
+                                    connected = false;
+                                } else if (!WriteChunk(
+                                               request,
+                                               reinterpret_cast<const BYTE*>(pcm16.data()),
+                                               outputBytes)) {
+                                    connected = false;
+                                } else {
+                                    ++successfulChunks;
+                                    if (!streamConfirmed && successfulChunks >= 3) {
+                                        streamConfirmed = true;
+                                        autoReconnectAttempts = 0;
+                                        serviceRetryDelay = false;
+                                        retryAfterDelay = false;
+                                        std::wcout << L"Connected. Audio data flowing.\n";
+                                    }
+                                }
+                            }
+
+                            if (!connected)
+                                break;
+
+                            frameOffset += segmentFrames;
                         }
 
-                        // 不插入保留段，下一轮立即继续丢。
+                        segment.frames -= segmentFrames;
+                        if (segment.frames == 0)
+                            compensationSchedule.pop_front();
+
+                        if (dropFrames == 0) {
+                            compensationSchedule.clear();
+                            if (dropBacklogActive) {
+                                std::wcout << L"Drop backlog cleared.\n";
+                                dropBacklogActive = false;
+                            }
+                        }
+
                         continue;
                     }
 
+                    // 没有补偿计划时，正常发送当前 packet 剩余内容。
                     const UINT32 sendFrames = framesLeft;
                     const size_t sampleCount =
                         static_cast<size_t>(sendFrames) * format->nChannels;
@@ -1373,7 +1597,8 @@ int wmain(int argc, wchar_t* argv[])
                         }
                     }
 
-                    frameOffset += sendFrames;
+                    if (connected)
+                        frameOffset += sendFrames;
                 }
 
                 captureClient->ReleaseBuffer(frames);
@@ -1382,10 +1607,30 @@ int wmain(int argc, wchar_t* argv[])
                     break;
 
                 // 网络写入累计阻塞达到阈值时，不断开连接。
-                // 全部累计阻塞时间都加入待丢预算，不再截断 200 ms。
-                // 按固定 20 ms 一轮连续丢弃：计算出轮数后连续执行，直到 dropFrames == 0。
+                // 把阻塞时间转换成历史音频欠账，然后重新计算一张“发送/丢弃”时间轴。
                 if (g_blockedMs >= kDropBacklogMs) {
                     const double dropMs = g_blockedMs;
+                    const auto now = std::chrono::steady_clock::now();
+
+                    if (haveLastCongestionTime) {
+                        const double intervalMs =
+                            std::chrono::duration<double, std::milli>(
+                                now - lastCongestionTime).count();
+
+                        if (intervalMs > 0.0) {
+                            if (intervalMs < kMinCongestionIntervalMs) {
+                                avgCongestionIntervalMs = kMinCongestionIntervalMs;
+                            } else {
+                                avgCongestionIntervalMs =
+                                    avgCongestionIntervalMs *
+                                        (1.0 - kCongestionIntervalEwmaAlpha) +
+                                    intervalMs * kCongestionIntervalEwmaAlpha;
+                            }
+                        }
+                    }
+
+                    lastCongestionTime = now;
+                    haveLastCongestionTime = true;
 
                     const uint64_t newDropFrames =
                         static_cast<uint64_t>(
@@ -1393,36 +1638,27 @@ int wmain(int argc, wchar_t* argv[])
                             dropMs / 1000.0);
 
                     dropFrames += newDropFrames;
-
-                    const uint64_t dropUnitFrames = std::max<uint64_t>(
-                        1,
-                        static_cast<uint64_t>(
-                            static_cast<double>(format->nSamplesPerSec) *
-                            kDropUnitMs / 1000.0));
-
-                    // 这里按“当前总欠账”计算需要连续丢多少个 20 ms 轮次。
-                    const uint64_t rounds =
-                        (dropFrames + dropUnitFrames - 1) / dropUnitFrames;
-                    const uint64_t remainderFrames =
-                        dropFrames % dropUnitFrames;
+                    dropBacklogActive = true;
+                    buildCompensationSchedule();
 
                     const double backlogMs =
                         static_cast<double>(dropFrames) * 1000.0 /
                         static_cast<double>(format->nSamplesPerSec);
+
+                    const bool dropAll =
+                        backlogMs >= kDropAllBacklogMs;
 
                     std::wcout
                         << L"Network congested (writes blocked "
                         << static_cast<long long>(dropMs)
                         << L" ms); queued "
                         << static_cast<long long>(backlogMs)
-                        << L" ms to drop in "
-                        << static_cast<unsigned long long>(rounds)
-                        << L" consecutive 20 ms rounds"
-                        << (remainderFrames
-                            ? L" (last round is partial).\n"
-                            : L".\n");
+                        << L" ms; calculated "
+                        << (dropAll
+                                ? L"full drop of old audio."
+                                : L"5 ms send/drop schedule.")
+                        << L"\n";
 
-                    dropBacklogActive = true;
                     g_blockedMs = 0.0;
                 }
 
@@ -1490,7 +1726,7 @@ int wmain(int argc, wchar_t* argv[])
                 stopAndFlushAudioCapture();
                 dropFrames = 0;
                 dropBacklogActive = false;
-                streamConfirmed = false;
+                                streamConfirmed = false;
 
                 ++autoReconnectAttempts;
 
