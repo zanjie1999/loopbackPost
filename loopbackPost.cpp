@@ -79,6 +79,11 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     uc.lpszExtraInfo = extra;
     uc.dwExtraInfoLength = _countof(extra);
 
+    // 只输入ip和端口时补充前缀和后缀
+    if (url.rfind(L"http", 0) != 0 &&
+        url = L"http://" + url + L"/aplay");
+    }
+
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
         PrintWinError(L"WinHttpCrackUrl");
         return false;
@@ -668,7 +673,8 @@ int wmain(int argc, wchar_t* argv[])
                 L"workdayAlarmClockGo/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
             if (!session) { PrintWinError(L"WinHttpOpen"); return false; }
-            WinHttpSetTimeouts(session, 5000, 5000, 10000, 10000);
+            // 设置超时：Resolve、Connect、Send、Receive
+            WinHttpSetTimeouts(session, 5000, 5000, 1000, 5000);
             connect = WinHttpConnect(session, finalParts.host.c_str(), finalParts.port, 0);
             if (!connect) { PrintWinError(L"WinHttpConnect"); closeHttp(); return false; }
             request = WinHttpOpenRequest(
