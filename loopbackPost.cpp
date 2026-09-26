@@ -61,7 +61,7 @@ struct UrlParts {
     bool https = false;
 };
 
-static bool CrackUrl(const std::wstring& url, UrlParts& out)
+static bool CrackUrl(const std::wstring& inUrl, UrlParts& out)
 {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
@@ -80,6 +80,7 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     uc.dwExtraInfoLength = _countof(extra);
 
     // 只输入ip和端口时补充前缀和后缀
+    std::wstring url = inUrl; 
     if (url.rfind(L"http", 0) != 0) {
         url = L"http://" + url + L"/aplay";
     }
