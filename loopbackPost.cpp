@@ -33,11 +33,8 @@ static constexpr double kBlockedWriteMs = 5.0;
 // 本次连接内累计“被挡住”的毫秒数
 static double g_blockedMs = 0.0;
 
-// 累计值超过这个阈值就触发重连
-static constexpr double kReconnectBlockedMs = 120.0;
-
-// 两次拥塞重连之间的冷却，避免网络持续抖动时疯狂重连
-static constexpr auto kCongestionCooldown = std::chrono::seconds(3);
+// 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。最大200
+static constexpr double kDropBacklogMs = 80.0;
 
 // 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
 static constexpr auto kCongestionReconnectDelay =
@@ -1005,11 +1002,9 @@ int wmain(int argc, wchar_t* argv[])
 
         bool connected = false;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
-        bool shortReconnectDelay = false; // 手动/拥塞：等待 200 ms
-        bool congested = false;       // 用于输出拥塞重连日志
-
-        auto lastCongestion =
-            std::chrono::steady_clock::now() - kCongestionCooldown;
+        bool shortReconnectDelay = false; // 手动重连：等待 200 ms
+        // 需要主动跳过的旧音频帧。只丢 WASAPI 已经积压的历史音频，不重建连接。
+        uint64_t dropFrames = 0;
 
         while (!g_stop.load()) {
             if (!connected) {
@@ -1028,12 +1023,9 @@ int wmain(int argc, wchar_t* argv[])
                         << L"Audio capture reinitialization failed. Retrying in 1 second.\n";
                     retryAfterDelay = true;
                     shortReconnectDelay = false;
-                    congested = false;
                     continue;
                 }
 
-                if (congested)
-                    std::wcout << L"Reconnecting to resync...\n";
                 std::wcout << L"Connecting...\n";
                 connected = openHttp();
 
@@ -1048,7 +1040,6 @@ int wmain(int argc, wchar_t* argv[])
                     // 真正等用户按 Enter，避免网络波动时疯狂重连。
                     retryAfterDelay = false;
                     shortReconnectDelay = false;
-                    congested = false;
                     g_blockedMs = 0.0;
 
                     while (!g_stop.load()) {
@@ -1070,13 +1061,11 @@ int wmain(int argc, wchar_t* argv[])
                     closeHttp();
                     connected = false;
                     retryAfterDelay = true;
-                    congested = false;
                     g_blockedMs = 0.0;
                     continue;
                 }
 
                 g_blockedMs = 0.0;
-                congested = false;
                 std::wcout << L"Connected.\n";
             }
 
@@ -1086,7 +1075,6 @@ int wmain(int argc, wchar_t* argv[])
                 connected = false;
                 retryAfterDelay = false;
                 shortReconnectDelay = true;
-                congested = false;
 
                 // 立刻 Stop+Reset 清掉当前捕获积压，然后等 200 ms。
                 // 这 200 ms 内采集保持停止，绝不会继续往 WASAPI buffer 里堆数据。
@@ -1139,8 +1127,25 @@ int wmain(int argc, wchar_t* argv[])
                     break;
                 }
 
+                // 如果前一次网络写入严重阻塞，WASAPI 会在这段时间继续积累历史音频。
+                // 这里直接从最老的 packet 开始跳过，达到“快进”效果。
+                const UINT32 skipFrames =
+                    static_cast<UINT32>(
+                        std::min<uint64_t>(dropFrames, frames));
+
+                const UINT32 sendFrames = frames - skipFrames;
+                dropFrames -= skipFrames;
+
+                if (skipFrames > 0) {
+                    std::wcout
+                        << L"Dropping " << skipFrames
+                        << L" old audio frames ("
+                        << (skipFrames * 1000ULL) / format->nSamplesPerSec
+                        << L" ms)\n";
+                }
+
                 const size_t sampleCount =
-                    static_cast<size_t>(frames) *
+                    static_cast<size_t>(sendFrames) *
                     format->nChannels;
 
                 const DWORD outputBytes =
@@ -1148,7 +1153,9 @@ int wmain(int argc, wchar_t* argv[])
                         sampleCount *
                         sizeof(int16_t));
 
-                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                if (sendFrames == 0) {
+                    // 整个 packet 都是需要丢掉的历史音频。
+                } else if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                     static BYTE zeroBuffer[64 * 1024]{};
 
                     DWORD left = outputBytes;
@@ -1177,9 +1184,13 @@ int wmain(int argc, wchar_t* argv[])
                     data != nullptr &&
                     frames > 0) {
 
+                    const size_t byteOffset =
+                        static_cast<size_t>(skipFrames) *
+                        format->nBlockAlign;
+
                     if (!ConvertToS16(
-                            data,
-                            frames,
+                            data + byteOffset,
+                            sendFrames,
                             format,
                             sampleType,
                             pcm16)) {
@@ -1203,36 +1214,24 @@ int wmain(int argc, wchar_t* argv[])
                 if (!connected || g_stop.load())
                     break;
 
-                // 拥塞判定：本次连接累计“被挡住的写入时间”超过阈值，
-                // 说明下游已经积压了至少一个发送缓冲的数据。
-                // 断开重连会触发服务端 kill aplay，把整条链路的积压清空。
-                if (g_blockedMs >= kReconnectBlockedMs) {
-                    const auto now =
-                        std::chrono::steady_clock::now();
+                // 网络写入累计阻塞达到阈值时，不断开连接。
+                // 把阻塞时间换算成音频帧，下一批从 WASAPI buffer 中直接跳过这些旧帧。
+                // 这样相当于“快进”，让播放延迟回到正常水平。
+                if (g_blockedMs >= kDropBacklogMs) {
+                    const uint64_t newDropFrames =
+                        static_cast<uint64_t>(
+                            format->nSamplesPerSec *
+                            g_blockedMs / 1000.0);
 
-                    if (now - lastCongestion >= kCongestionCooldown) {
-                        lastCongestion = now;
+                    dropFrames += newDropFrames;
 
-                        std::wcout
-                            << L"Network congested (writes blocked "
-                            << static_cast<long long>(g_blockedMs)
-                            << L" ms); dropping the connection to flush the backlog.\n";
+                    std::wcout
+                        << L"Network congested (writes blocked "
+                        << static_cast<long long>(g_blockedMs)
+                        << L" ms); scheduling "
+                        << static_cast<long long>(g_blockedMs)
+                        << L" ms of old audio to be dropped.\n";
 
-                        closeHttp();
-                        connected = false;
-                        congested = true;
-                        shortReconnectDelay = true;
-
-                        // 立刻停止并清空 WASAPI 捕获缓冲；150 ms 等待期间保持停止。
-                        if (!stopAndFlushAudioCapture()) {
-                            std::wcerr
-                                << L"Failed to flush audio capture after congestion; will rebuild it during reconnect.\n";
-                        }
-                        break;
-                    }
-
-                    // 还在冷却期，先不重连；清零重新观察，
-                    // 免得冷却一结束就立刻又触发
                     g_blockedMs = 0.0;
                 }
 
@@ -1251,18 +1250,13 @@ int wmain(int argc, wchar_t* argv[])
             if (!connected && !g_stop.load()) {
                 closeHttp();
 
-                if (congested) {
-                    std::wcerr
-                        << L"Congestion reconnect; capture stopped, flushing buffers, waiting 200 ms.\n";
-                    retryAfterDelay = false;
-                    shortReconnectDelay = true;
-                } else {
+                {
                     std::wcerr
                         << L"Connection interrupted; capture stopped, retrying in 1 second.\n";
                     retryAfterDelay = true;
                     shortReconnectDelay = false;
 
-                    // 普通网络错误也不能让 WASAPI 在 1 秒重连等待期间继续积压。
+                    // 普通网络错误仍然重连；只有“写入变慢但连接没断”才使用丢旧音频补偿。
                     stopAndFlushAudioCapture();
                 }
             }
