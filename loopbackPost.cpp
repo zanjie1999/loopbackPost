@@ -831,7 +831,7 @@ int wmain(int argc, wchar_t* argv[])
                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
             if (!session) { PrintWinError(L"WinHttpOpen"); return false; }
             // 设置超时：Resolve、Connect、Send、Receive
-            WinHttpSetTimeouts(session, 5000, 5000, 1000, 5000);
+            WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
             connect = WinHttpConnect(session, activeParts.host.c_str(), activeParts.port, 0);
             if (!connect) { PrintWinError(L"WinHttpConnect"); closeHttp(); return false; }
             request = WinHttpOpenRequest(
