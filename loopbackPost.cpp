@@ -41,7 +41,7 @@ static constexpr double kBlockedWriteMs = 5.0;
 static double g_blockedMs = 0.0;
 
 // 累计值超过这个阈值就触发重连
-static constexpr double kReconnectBlockedMs = 200.0;
+static constexpr double kReconnectBlockedMs = 100.0;
 
 // 两次拥塞重连之间的冷却，避免网络持续抖动时疯狂重连
 static constexpr auto kCongestionCooldown = std::chrono::seconds(3);
