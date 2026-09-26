@@ -27,13 +27,6 @@
 
 static std::atomic_bool g_stop{false};
 
-// ============ 拥塞检测 / 强制同步 ============
-// 思路：一次几 KB 的写入在局域网上本该在微秒级返回。要花掉毫秒级，
-// 只可能是 TCP 发送缓冲已经被写满、正等着对端消费 —— 换句话说，
-// 此刻下游至少积压了一个发送缓冲的数据。把这种“被挡住”的时间累计起来，
-// 超过阈值就主动断开重连，借服务端“断连即 kill aplay”的行为，
-// 把从 TCP 缓冲一直到最后 ALSA 缓冲的整条链路上的积压一次性清空。
-
 // 单次写入超过这个毫秒数，就认为它被写满的发送缓冲挡住了
 static constexpr double kBlockedWriteMs = 5.0;
 
@@ -45,11 +38,6 @@ static constexpr double kReconnectBlockedMs = 100.0;
 
 // 两次拥塞重连之间的冷却，避免网络持续抖动时疯狂重连
 static constexpr auto kCongestionCooldown = std::chrono::seconds(3);
-
-// 拥塞重连不等普通重连那 1 秒，但仍留一点时间让服务端把旧的 aplay
-// 杀掉、把 ALSA 设备放开，否则新的 aplay 可能打不开设备
-static constexpr auto kCongestionReconnectDelay =
-    std::chrono::milliseconds(150);
 
 BOOL WINAPI ConsoleHandler(DWORD type)
 {
@@ -640,6 +628,30 @@ int wmain(int argc, wchar_t* argv[])
             break;
         }
 
+        // 保存当前默认输出设备的 ID。每次重连都会重新查询默认输出，
+        // 如果设备发生变化，就重新建立 loopback capture。
+        std::wstring deviceId;
+        {
+            LPWSTR rawId = nullptr;
+            hr = device->GetId(&rawId);
+            if (FAILED(hr)) {
+                PrintHr(L"IMMDevice::GetId", hr);
+                break;
+            }
+            if (rawId) {
+                deviceId = rawId;
+                CoTaskMemFree(rawId);
+            }
+        }
+
+        SampleType sampleType = GetSampleType(format);
+
+        if (sampleType == SampleType::UNSUPPORTED) {
+            std::wcerr
+                << L"Unsupported WASAPI sample format.\n";
+            break;
+        }
+
         std::wcout
             << L"Capture format: "
             << format->nSamplesPerSec
@@ -657,21 +669,12 @@ int wmain(int argc, wchar_t* argv[])
         else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
             std::wcout << L", WAVE_FORMAT_EXTENSIBLE";
 
-        SampleType sampleType =
-            GetSampleType(format);
-
         std::wcout
             << L", source="
             << SampleTypeName(sampleType)
             << L"\n";
 
-        if (sampleType == SampleType::UNSUPPORTED) {
-            std::wcerr
-                << L"Unsupported WASAPI sample format.\n";
-            break;
-        }
-
-        const std::wstring finalUrl =
+        std::wstring finalUrl =
             BuildAudioUrl(
                 url,
                 format->nSamplesPerSec,
@@ -730,6 +733,219 @@ int wmain(int argc, wchar_t* argv[])
                 closeHttp();
                 return false;
             }
+            return true;
+        };
+
+        // 重连前把 WASAPI 侧的积压直接丢掉，避免网络断开期间积累的音频
+        // 在新连接建立后继续补发，形成“重连后仍有延迟”。
+        const auto resetAudioCapture = [&]() -> bool {
+            if (!audioClient)
+                return false;
+
+            hr = audioClient->Stop();
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::Stop(reconnect)", hr);
+                return false;
+            }
+
+            hr = audioClient->Reset();
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::Reset(reconnect)", hr);
+                return false;
+            }
+
+            hr = audioClient->Start();
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::Start(reconnect)", hr);
+                return false;
+            }
+
+            return true;
+        };
+
+        // 每次重连都重新读取默认输出设备。
+        // 设备没变：只 Reset 当前 loopback，清空捕获缓冲。
+        // 设备变了：完整释放旧 endpoint，并按新设备重新初始化 WASAPI。
+        const auto refreshAudioDevice = [&]() -> bool {
+            IMMDevice* currentDevice = nullptr;
+
+            hr = enumerator->GetDefaultAudioEndpoint(
+                eRender,
+                eMultimedia,
+                &currentDevice);
+
+            if (FAILED(hr)) {
+                PrintHr(L"GetDefaultAudioEndpoint(reconnect)", hr);
+                return false;
+            }
+
+            LPWSTR rawId = nullptr;
+            hr = currentDevice->GetId(&rawId);
+            if (FAILED(hr)) {
+                PrintHr(L"IMMDevice::GetId(reconnect)", hr);
+                currentDevice->Release();
+                return false;
+            }
+
+            std::wstring currentId = rawId ? rawId : L"";
+            if (rawId)
+                CoTaskMemFree(rawId);
+
+            if (currentId == deviceId) {
+                // 同一设备也必须 Reset，否则重连期间的 loopback 数据会继续排队。
+                if (resetAudioCapture()) {
+                    currentDevice->Release();
+                    return true;
+                }
+
+                // Reset 失败时保留 currentDevice，下面直接完整重建当前 endpoint。
+                std::wcerr
+                    << L"Audio capture reset failed; rebuilding current endpoint.\n";
+            } else {
+                std::wcout
+                    << L"Default audio output changed; switching capture device.\n";
+            }
+
+            if (audioClient)
+                audioClient->Stop();
+
+            if (captureClient) {
+                captureClient->Release();
+                captureClient = nullptr;
+            }
+
+            if (audioClient) {
+                audioClient->Release();
+                audioClient = nullptr;
+            }
+
+            if (device) {
+                device->Release();
+                device = nullptr;
+            }
+
+            if (format) {
+                CoTaskMemFree(format);
+                format = nullptr;
+            }
+
+            device = currentDevice;
+            currentDevice = nullptr;
+            deviceId = currentId;
+
+            hr = device->Activate(
+                __uuidof(IAudioClient),
+                CLSCTX_ALL,
+                nullptr,
+                reinterpret_cast<void**>(&audioClient));
+
+            if (FAILED(hr)) {
+                PrintHr(L"IMMDevice::Activate(IAudioClient,reconnect)", hr);
+                return false;
+            }
+
+            hr = audioClient->GetMixFormat(&format);
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::GetMixFormat(reconnect)", hr);
+                return false;
+            }
+
+            sampleType = GetSampleType(format);
+            if (sampleType == SampleType::UNSUPPORTED) {
+                std::wcerr
+                    << L"Unsupported WASAPI sample format after device switch.\n";
+                return false;
+            }
+
+            finalUrl = BuildAudioUrl(
+                url,
+                format->nSamplesPerSec,
+                format->nChannels);
+
+            if (finalUrl.empty() || !CrackUrl(finalUrl, finalParts))
+                return false;
+
+            REFERENCE_TIME defaultPeriod = 0;
+            REFERENCE_TIME minPeriod = 0;
+
+            hr = audioClient->GetDevicePeriod(
+                &defaultPeriod,
+                &minPeriod);
+
+            if (FAILED(hr) || defaultPeriod <= 0)
+                defaultPeriod = 100000;
+
+            constexpr REFERENCE_TIME targetDuration = 300000;
+
+            const REFERENCE_TIME bufferDuration =
+                ((targetDuration + defaultPeriod - 1) / defaultPeriod) *
+                defaultPeriod;
+
+            hr = audioClient->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                bufferDuration,
+                0,
+                format,
+                nullptr);
+
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::Initialize(loopback,reconnect)", hr);
+                return false;
+            }
+
+            UINT32 actualBufferFrames = 0;
+            if (SUCCEEDED(audioClient->GetBufferSize(&actualBufferFrames)) &&
+                format->nSamplesPerSec > 0) {
+                std::wcout
+                    << L"Actual capture buffer: "
+                    << actualBufferFrames
+                    << L" frames ("
+                    << (actualBufferFrames * 1000ULL) /
+                           format->nSamplesPerSec
+                    << L" ms)\n";
+            }
+
+            hr = audioClient->GetService(
+                __uuidof(IAudioCaptureClient),
+                reinterpret_cast<void**>(&captureClient));
+
+            if (FAILED(hr)) {
+                PrintHr(
+                    L"IAudioClient::GetService(IAudioCaptureClient,reconnect)",
+                    hr);
+                return false;
+            }
+
+            hr = audioClient->Start();
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::Start(reconnect)", hr);
+                return false;
+            }
+
+            std::wcout
+                << L"Capture format: "
+                << format->nSamplesPerSec
+                << L" Hz, "
+                << format->nChannels
+                << L" ch, "
+                << format->wBitsPerSample
+                << L" bit, source="
+                << SampleTypeName(sampleType)
+                << L"\n";
+
+            std::wcout
+                << L"Output format: "
+                << format->nSamplesPerSec
+                << L" Hz, "
+                << format->nChannels
+                << L" ch, s16le\n";
+
+            std::wcout
+                << L"Streaming PCM to: "
+                << finalUrl
+                << L"\n";
+
             return true;
         };
 
@@ -813,7 +1029,7 @@ int wmain(int argc, wchar_t* argv[])
 
         bool connected = false;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
-        bool congested = false;       // 拥塞触发的重连：只等一小会
+        bool congested = false;       // 用于输出拥塞重连日志
 
         auto lastCongestion =
             std::chrono::steady_clock::now() - kCongestionCooldown;
@@ -822,12 +1038,18 @@ int wmain(int argc, wchar_t* argv[])
             if (!connected) {
                 if (retryAfterDelay) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
-                } else if (congested) {
-                    std::this_thread::sleep_for(
-                        kCongestionReconnectDelay);
                 }
                 if (g_stop.load())
                     break;
+
+                if (!refreshAudioDevice()) {
+                    std::wcerr
+                        << L"Audio capture reinitialization failed. Retrying in 1 second.\n";
+                    retryAfterDelay = true;
+                    congested = false;
+                    continue;
+                }
+
                 if (congested)
                     std::wcout << L"Reconnecting to resync...\n";
                 std::wcout << L"Connecting...\n";
@@ -848,8 +1070,10 @@ int wmain(int argc, wchar_t* argv[])
             }
 
             if (_kbhit() && _getch() == '\r') {
-                std::wcout << L"Reconnect requested.\n";
+                std::wcout << L"Reconnect requested; refreshing audio output device and flushing capture backlog.\n";
                 connected = false;
+                retryAfterDelay = false;
+                congested = false;
                 closeHttp();
                 continue;
             }
@@ -999,7 +1223,10 @@ int wmain(int argc, wchar_t* argv[])
 
             if (!connected && !g_stop.load()) {
                 if (congested) {
-                    std::wcerr << L"Congestion reconnect; retrying now.\n";
+                    // 不再等待 150 ms。WASAPI 在等待期间仍会继续积累数据，
+                    // 这正是原来“拥塞重连后仍有延迟”的主要来源。
+                    std::wcerr << L"Congestion reconnect; flushing buffers and retrying now.\n";
+                    retryAfterDelay = false;
                 } else {
                     std::wcerr << L"Connection interrupted; retrying in 1 second.\n";
                     retryAfterDelay = true;
