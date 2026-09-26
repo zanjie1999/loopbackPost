@@ -32,9 +32,17 @@ static constexpr double kBlockedWriteMs = 5.0;
 
 // 本次连接内累计“被挡住”的毫秒数
 static double g_blockedMs = 0.0;
+static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 
-// 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。最大200
-static constexpr double kDropBacklogMs = 80.0;
+// 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
+static constexpr double kDropBacklogMs = 60.0;
+
+// HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
+static constexpr int kMaxAutoReconnectAttempts = 3;
+
+// 使用命令行 URL 启动时，3 次自动重连全部失败后继续后台运行，
+// 每 10 秒重新尝试一次，适合开机启动；交互模式仍等待 Enter。
+static constexpr auto kServiceRetryDelay = std::chrono::seconds(10);
 
 // 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
 static constexpr auto kCongestionReconnectDelay =
@@ -232,6 +240,95 @@ static std::wstring BuildAudioUrl(const std::wstring& originalUrl,
     return result;
 }
 
+static bool ReadHttpResponse(HINTERNET request,
+                              DWORD& status,
+                              std::string& body,
+                              std::wstring& location)
+{
+    status = 0;
+    body.clear();
+    location.clear();
+
+    if (!WinHttpReceiveResponse(request, nullptr))
+        return false;
+
+    DWORD statusSize = sizeof(status);
+    if (!WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX)) {
+        status = 0;
+    }
+
+    DWORD locationSize = 0;
+    WinHttpQueryHeaders(
+        request,
+        WINHTTP_QUERY_LOCATION,
+        WINHTTP_HEADER_NAME_BY_INDEX,
+        nullptr,
+        &locationSize,
+        WINHTTP_NO_HEADER_INDEX);
+
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && locationSize > 0) {
+        std::vector<wchar_t> buffer(locationSize / sizeof(wchar_t) + 1);
+        if (WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_LOCATION,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                buffer.data(),
+                &locationSize,
+                WINHTTP_NO_HEADER_INDEX)) {
+            location.assign(buffer.data(), locationSize / sizeof(wchar_t));
+        }
+    }
+
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available))
+            break;
+
+        if (available == 0)
+            break;
+
+        std::vector<char> buffer(available);
+        DWORD read = 0;
+        if (!WinHttpReadData(
+                request,
+                buffer.data(),
+                available,
+                &read)) {
+            break;
+        }
+
+        if (read == 0)
+            break;
+
+        body.append(buffer.data(), read);
+    }
+
+    return true;
+}
+
+static void PrintHttpResponse(DWORD status,
+                              const std::string& body,
+                              const std::wstring& location)
+{
+    if (status != 0)
+        std::wcerr << L"HTTP status: " << status << L"\n";
+
+    if (!location.empty())
+        std::wcerr << L"HTTP Location: " << location << L"\n";
+
+    if (!body.empty()) {
+        std::wcerr << L"HTTP response body: ";
+        std::cerr.write(body.data(), static_cast<std::streamsize>(body.size()));
+        std::cerr << "\n";
+    }
+}
+
 static bool WriteRaw(HINTERNET request,
                      const BYTE* data,
                      DWORD bytes)
@@ -246,7 +343,8 @@ static bool WriteRaw(HINTERNET request,
                 data,
                 bytes,
                 &written)) {
-            PrintWinError(L"WinHttpWriteData");
+            g_lastWinHttpError = GetLastError();
+            PrintWinError(L"WinHttpWriteData", g_lastWinHttpError);
             return false;
         }
 
@@ -256,6 +354,8 @@ static bool WriteRaw(HINTERNET request,
 
         if (writeMs > kBlockedWriteMs)
             g_blockedMs += writeMs;
+
+        g_lastWinHttpError = ERROR_SUCCESS;
 
         if (written == 0) {
             std::wcerr
@@ -689,6 +789,10 @@ int wmain(int argc, wchar_t* argv[])
         if (!CrackUrl(finalUrl, finalParts))
             break;
 
+        // 当前实际使用的地址。302 时优先使用 Location；如果服务端只做 8080 -> 8880，
+        // 也会自动切换到 8880。
+        UrlParts activeParts = finalParts;
+
         std::wcout
             << L"Output format: "
             << format->nSamplesPerSec
@@ -715,10 +819,10 @@ int wmain(int argc, wchar_t* argv[])
             if (!session) { PrintWinError(L"WinHttpOpen"); return false; }
             // 设置超时：Resolve、Connect、Send、Receive
             WinHttpSetTimeouts(session, 5000, 5000, 1000, 5000);
-            connect = WinHttpConnect(session, finalParts.host.c_str(), finalParts.port, 0);
+            connect = WinHttpConnect(session, activeParts.host.c_str(), activeParts.port, 0);
             if (!connect) { PrintWinError(L"WinHttpConnect"); closeHttp(); return false; }
             request = WinHttpOpenRequest(
-                connect, L"PUT", finalParts.path.c_str(), nullptr,
+                connect, L"PUT", activeParts.path.c_str(), nullptr,
                 WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                 finalParts.https ? WINHTTP_FLAG_SECURE : 0);
             if (!request) { PrintWinError(L"WinHttpOpenRequest"); closeHttp(); return false; }
@@ -999,16 +1103,22 @@ int wmain(int argc, wchar_t* argv[])
         ok = true;
 
         std::vector<int16_t> pcm16;
+        const bool serviceMode = (argc >= 2);
 
         bool connected = false;
+        bool streamConfirmed = false; // 至少成功写出过一块音频数据
+        int autoReconnectAttempts = 0;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
+        bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
         bool shortReconnectDelay = false; // 手动重连：等待 200 ms
         // 需要主动跳过的旧音频帧。只丢 WASAPI 已经积压的历史音频，不重建连接。
         uint64_t dropFrames = 0;
 
         while (!g_stop.load()) {
             if (!connected) {
-                if (retryAfterDelay) {
+                if (serviceRetryDelay) {
+                    std::this_thread::sleep_for(kServiceRetryDelay);
+                } else if (retryAfterDelay) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 } else if (shortReconnectDelay) {
                     // 200 ms 等待期间采集已经 Stop+Reset，因此不会产生新的音频积压。
@@ -1033,26 +1143,40 @@ int wmain(int argc, wchar_t* argv[])
                 shortReconnectDelay = false;
 
                 if (!connected) {
-                    std::wcerr
-                        << L"Reconnect failed; audio capture remains stopped. Press Enter to retry.\n";
-
-                    // 自动重连失败后，不再继续循环重连。
-                    // 真正等用户按 Enter，避免网络波动时疯狂重连。
-                    retryAfterDelay = false;
-                    shortReconnectDelay = false;
-                    g_blockedMs = 0.0;
-
-                    while (!g_stop.load()) {
-                        if (_kbhit() && _getch() == '\r') {
-                            // 用户主动重试也统一走 200 ms 的静音窗口，
-                            // 之后重新获取默认输出设备再建立连接。
-                            shortReconnectDelay = true;
-                            break;
+                    ++autoReconnectAttempts;
+                    if (serviceMode && serviceRetryDelay) {
+                        // 已进入后台重试阶段：之后每次失败都固定等待 10 秒。
+                        std::wcerr
+                            << L"HTTP connect failed; retrying in 10 seconds.\n";
+                        retryAfterDelay = false;
+                        shortReconnectDelay = false;
+                    } else if (autoReconnectAttempts < kMaxAutoReconnectAttempts) {
+                        std::wcerr
+                            << L"HTTP connect failed; retrying in 1 second (attempt "
+                            << autoReconnectAttempts << L"/" << kMaxAutoReconnectAttempts << L").\n";
+                        retryAfterDelay = true;
+                        shortReconnectDelay = false;
+                    } else if (serviceMode) {
+                        std::wcerr
+                            << L"Reconnect failed 3 times; retrying automatically in 10 seconds.\n";
+                        retryAfterDelay = false;
+                        serviceRetryDelay = true;
+                        shortReconnectDelay = false;
+                    } else {
+                        std::wcerr
+                            << L"Reconnect failed 3 times; press Enter to retry.\n";
+                        retryAfterDelay = false;
+                        shortReconnectDelay = false;
+                        while (!g_stop.load()) {
+                            if (_kbhit() && _getch() == '\r') {
+                                autoReconnectAttempts = 0;
+                                shortReconnectDelay = true;
+                                break;
+                            }
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(50));
                         }
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(50));
                     }
-
                     continue;
                 }
 
@@ -1060,20 +1184,30 @@ int wmain(int argc, wchar_t* argv[])
                 if (!startAudioCapture()) {
                     closeHttp();
                     connected = false;
-                    retryAfterDelay = true;
+                    ++autoReconnectAttempts;
+                    if (serviceMode && serviceRetryDelay) {
+                        retryAfterDelay = false;
+                    } else {
+                        retryAfterDelay = true;
+                    }
                     g_blockedMs = 0.0;
                     continue;
                 }
 
                 g_blockedMs = 0.0;
-                std::wcout << L"Connected.\n";
+                streamConfirmed = false;
+                std::wcout
+                    << L"HTTP connected; waiting for first audio write...\n";
             }
 
             if (_kbhit() && _getch() == '\r') {
                 std::wcout << L"Reconnect requested; flushing capture and refreshing audio output device.\n";
                 closeHttp();
                 connected = false;
+                streamConfirmed = false;
+                autoReconnectAttempts = 0;
                 retryAfterDelay = false;
+                serviceRetryDelay = false;
                 shortReconnectDelay = true;
 
                 // 立刻 Stop+Reset 清掉当前捕获积压，然后等 200 ms。
@@ -1136,14 +1270,6 @@ int wmain(int argc, wchar_t* argv[])
                 const UINT32 sendFrames = frames - skipFrames;
                 dropFrames -= skipFrames;
 
-                if (skipFrames > 0) {
-                    std::wcout
-                        << L"Dropping " << skipFrames
-                        << L" old audio frames ("
-                        << (skipFrames * 1000ULL) / format->nSamplesPerSec
-                        << L" ms)\n";
-                }
-
                 const size_t sampleCount =
                     static_cast<size_t>(sendFrames) *
                     format->nChannels;
@@ -1178,6 +1304,14 @@ int wmain(int argc, wchar_t* argv[])
                             break;
                         }
 
+                        if (!streamConfirmed) {
+                            streamConfirmed = true;
+                            autoReconnectAttempts = 0;
+                            serviceRetryDelay = false;
+                            retryAfterDelay = false;
+                            std::wcout << L"Connected. Audio data flowing.\n";
+                        }
+
                         left -= chunk;
                     }
                 } else if (
@@ -1205,6 +1339,12 @@ int wmain(int argc, wchar_t* argv[])
                                     pcm16.data()),
                                 outputBytes)) {
                             connected = false;
+                        } else if (!streamConfirmed) {
+                            streamConfirmed = true;
+                            autoReconnectAttempts = 0;
+                            serviceRetryDelay = false;
+                            retryAfterDelay = false;
+                            std::wcout << L"Connected. Audio data flowing.\n";
                         }
                     }
                 }
@@ -1218,10 +1358,13 @@ int wmain(int argc, wchar_t* argv[])
                 // 把阻塞时间换算成音频帧，下一批从 WASAPI buffer 中直接跳过这些旧帧。
                 // 这样相当于“快进”，让播放延迟回到正常水平。
                 if (g_blockedMs >= kDropBacklogMs) {
+                    const double dropMs =
+                        (g_blockedMs < 200.0) ? g_blockedMs : 200.0;
+
                     const uint64_t newDropFrames =
                         static_cast<uint64_t>(
                             format->nSamplesPerSec *
-                            g_blockedMs / 1000.0);
+                            dropMs / 1000.0);
 
                     dropFrames += newDropFrames;
 
@@ -1229,7 +1372,7 @@ int wmain(int argc, wchar_t* argv[])
                         << L"Network congested (writes blocked "
                         << static_cast<long long>(g_blockedMs)
                         << L" ms); scheduling "
-                        << static_cast<long long>(g_blockedMs)
+                        << static_cast<long long>(dropMs)
                         << L" ms of old audio to be dropped.\n";
 
                     g_blockedMs = 0.0;
@@ -1248,16 +1391,93 @@ int wmain(int argc, wchar_t* argv[])
             }
 
             if (!connected && !g_stop.load()) {
-                closeHttp();
+                DWORD httpStatus = 0;
+                std::string responseBody;
+                std::wstring location;
 
-                {
+                // WinHttpWriteData 失败时，服务端可能已经返回 404/500/302。
+                // 尝试把响应读出来，至少把状态码和 JSON 错误打印给用户。
+                if (request) {
+                    if (ReadHttpResponse(request, httpStatus, responseBody, location)) {
+                        PrintHttpResponse(httpStatus, responseBody, location);
+
+                        // 302/301/307/308：优先跟随 Location。对于常见的
+                        // 8080 -> 8880 重定向，即使 Location 没拿到，也走 8880。
+                        if (httpStatus >= 300 && httpStatus < 400) {
+                            UrlParts redirected;
+                            bool redirectedOk =
+                                !location.empty() &&
+                                CrackUrl(location, redirected);
+
+                            if (redirectedOk) {
+                                SetQueryParameter(
+                                    redirected.path, L"rate",
+                                    std::to_wstring(format->nSamplesPerSec));
+                                SetQueryParameter(
+                                    redirected.path, L"channels",
+                                    std::to_wstring(format->nChannels));
+                                activeParts = redirected;
+                                std::wcout
+                                    << L"Following HTTP redirect to "
+                                    << (activeParts.https ? L"https://" : L"http://")
+                                    << activeParts.host << L":" << activeParts.port
+                                    << activeParts.path << L"\n";
+                            } else if (activeParts.port == 8080) {
+                                activeParts.port = 8880;
+                                std::wcout
+                                    << L"HTTP redirect detected; switching port 8080 -> 8880.\n";
+                            }
+                        }
+                    }
+                }
+
+                if (g_lastWinHttpError == ERROR_WINHTTP_CONNECTION_ERROR &&
+                    activeParts.port == 8080) {
+                    activeParts.port = 8880;
+                    std::wcout
+                        << L"WinHTTP connection error on port 8080; trying port 8880.\n";
+                }
+
+                closeHttp();
+                stopAndFlushAudioCapture();
+                streamConfirmed = false;
+
+                ++autoReconnectAttempts;
+
+                if (serviceMode && serviceRetryDelay) {
+                    // 已进入后台重试阶段：之后每次失败都固定等待 10 秒。
                     std::wcerr
-                        << L"Connection interrupted; capture stopped, retrying in 1 second.\n";
+                        << L"Connection interrupted; capture stopped, retrying in 10 seconds.\n";
+                    retryAfterDelay = false;
+                    shortReconnectDelay = false;
+                } else if (autoReconnectAttempts < kMaxAutoReconnectAttempts) {
+                    std::wcerr
+                        << L"Connection interrupted; capture stopped, retrying in 1 second (attempt "
+                        << autoReconnectAttempts << L"/" << kMaxAutoReconnectAttempts << L").\n";
                     retryAfterDelay = true;
                     shortReconnectDelay = false;
+                } else if (serviceMode) {
+                    std::wcerr
+                        << L"Reconnect failed 3 times; retrying automatically in 10 seconds.\n";
+                    retryAfterDelay = false;
+                    serviceRetryDelay = true;
+                    shortReconnectDelay = false;
+                } else {
+                    std::wcerr
+                        << L"Reconnect failed 3 times; press Enter to retry.\n";
+                    retryAfterDelay = false;
+                    serviceRetryDelay = false;
+                    shortReconnectDelay = false;
 
-                    // 普通网络错误仍然重连；只有“写入变慢但连接没断”才使用丢旧音频补偿。
-                    stopAndFlushAudioCapture();
+                    while (!g_stop.load()) {
+                        if (_kbhit() && _getch() == '\r') {
+                            autoReconnectAttempts = 0;
+                            shortReconnectDelay = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
+                    }
                 }
             }
         }
