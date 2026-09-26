@@ -37,10 +37,10 @@ static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 // 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
 static constexpr double kDropBacklogMs = 60.0;
 
-// 拥塞补偿不再连续丢一整段，而是周期性“保留 80 ms + 跳过 20 ms”。
-// 听感会更接近轻微加速/快进，而不是突然缺失一整段。
-static constexpr double kDropPatternKeepMs = 80.0;
-static constexpr double kDropPatternSkipMs = 20.0;
+// 拥塞补偿固定按 20 ms 一轮连续丢弃。
+// 例如累计欠账 163 ms，就连续丢 8 个完整的 20 ms 轮次，最后再丢 3 ms，
+// 中间不插入保留音频，直到待补偿延迟清零。
+static constexpr double kDropUnitMs = 20.0;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -1117,11 +1117,9 @@ int wmain(int argc, wchar_t* argv[])
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
         bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
         bool shortReconnectDelay = false; // 手动重连：等待 200 ms
-        // 需要通过“跳着丢”补偿掉的旧音频帧总量。
+        // 需要通过连续 20 ms 轮次丢掉的旧音频帧总量。
         uint64_t dropFrames = 0;
-        // 当前周期还需要保留/跳过多少帧。
-        uint64_t dropPatternKeepFrames = 0;
-        uint64_t dropPatternSkipFrames = 0;
+        bool dropBacklogActive = false;
 
         while (!g_stop.load()) {
             if (!connected) {
@@ -1206,6 +1204,8 @@ int wmain(int argc, wchar_t* argv[])
                 g_blockedMs = 0.0;
                 streamConfirmed = false;
                 successfulChunks = 0;
+                dropFrames = 0;
+                dropBacklogActive = false;
                 std::wcout
                     << L"HTTP connected; waiting for audio writes...\n";
             }
@@ -1220,6 +1220,8 @@ int wmain(int argc, wchar_t* argv[])
                 retryAfterDelay = false;
                 serviceRetryDelay = false;
                 shortReconnectDelay = true;
+                dropFrames = 0;
+                dropBacklogActive = false;
 
                 // 立刻 Stop+Reset 清掉当前捕获积压，然后等 200 ms。
                 // 这 200 ms 内采集保持停止，绝不会继续往 WASAPI buffer 里堆数据。
@@ -1229,8 +1231,7 @@ int wmain(int argc, wchar_t* argv[])
                 }
 
                 dropFrames = 0;
-                dropPatternKeepFrames = 0;
-                dropPatternSkipFrames = 0;
+                dropBacklogActive = false;
                 g_blockedMs = 0.0;
                 continue;
             }
@@ -1278,214 +1279,101 @@ int wmain(int argc, wchar_t* argv[])
                 }
 
                 // 如果前一次网络写入严重阻塞，WASAPI 会在这段时间继续积累历史音频。
-                // 不再一次性连续丢完，而是按“保留 80 ms + 跳过 20 ms”循环处理，
-                // 让听感更像轻微加速/快进。
+                // 固定按 20 ms 一轮连续丢弃：先计算需要多少轮，再连续执行，直到 dropFrames == 0。
                 UINT32 frameOffset = 0;
+                const uint64_t dropUnitFrames = std::max<uint64_t>(
+                    1,
+                    static_cast<uint64_t>(
+                        static_cast<double>(format->nSamplesPerSec) *
+                        kDropUnitMs / 1000.0));
 
                 while (frameOffset < frames && connected && !g_stop.load()) {
                     const UINT32 framesLeft = frames - frameOffset;
 
-                    // 没有待补偿的历史音频：整段正常发送。
-                    if (dropFrames == 0) {
-                        dropPatternKeepFrames = 0;
-                        dropPatternSkipFrames = 0;
-
-                        const UINT32 sendFrames = framesLeft;
-                        const size_t sampleCount =
-                            static_cast<size_t>(sendFrames) *
-                            format->nChannels;
-                        const DWORD outputBytes =
-                            static_cast<DWORD>(sampleCount * sizeof(int16_t));
-                        const BYTE* segmentData =
-                            (data != nullptr)
-                                ? data + static_cast<size_t>(frameOffset) * format->nBlockAlign
-                                : nullptr;
-
-                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                            static BYTE zeroBuffer[64 * 1024]{};
-                            DWORD left = outputBytes;
-
-                            while (left > 0 && !g_stop.load()) {
-                                DWORD chunk =
-                                    (left < static_cast<DWORD>(sizeof(zeroBuffer)))
-                                        ? left
-                                        : static_cast<DWORD>(sizeof(zeroBuffer));
-
-                                if (!WriteChunk(request, zeroBuffer, chunk)) {
-                                    connected = false;
-                                    break;
-                                }
-
-                                ++successfulChunks;
-                                if (!streamConfirmed && successfulChunks >= 3) {
-                                    streamConfirmed = true;
-                                    autoReconnectAttempts = 0;
-                                    serviceRetryDelay = false;
-                                    retryAfterDelay = false;
-                                    std::wcout << L"Connected. Audio data flowing.\n";
-                                }
-
-                                left -= chunk;
-                            }
-                        } else if (segmentData != nullptr && sendFrames > 0) {
-                            if (!ConvertToS16(
-                                    segmentData,
-                                    sendFrames,
-                                    format,
-                                    sampleType,
-                                    pcm16)) {
-                                std::wcerr << L"PCM conversion failed.\n";
-                                connected = false;
-                            } else if (!WriteChunk(
-                                           request,
-                                           reinterpret_cast<const BYTE*>(pcm16.data()),
-                                           outputBytes)) {
-                                connected = false;
-                            } else {
-                                ++successfulChunks;
-                                if (!streamConfirmed && successfulChunks >= 3) {
-                                    streamConfirmed = true;
-                                    autoReconnectAttempts = 0;
-                                    serviceRetryDelay = false;
-                                    retryAfterDelay = false;
-                                    std::wcout << L"Connected. Audio data flowing.\n";
-                                }
-                            }
-                        }
-
-                        frameOffset += sendFrames;
-                        continue;
-                    }
-
-                    // 第一次进入跳帧补偿时，先保留一小段，再开始丢帧。
-                    if (dropPatternKeepFrames == 0 && dropPatternSkipFrames == 0) {
-                        dropPatternKeepFrames = static_cast<uint64_t>(
-                            (static_cast<uint64_t>(format->nSamplesPerSec) *
-                             static_cast<uint64_t>(kDropPatternKeepMs)) /
-                            1000ULL);
-
-                        if (dropPatternKeepFrames == 0)
-                            dropPatternKeepFrames = 1;
-                    }
-
-                    if (dropPatternKeepFrames > 0) {
-                        // 保留这一小段：正常发送，但不消耗 dropFrames。
-                        const UINT32 sendFrames =
-                            static_cast<UINT32>(
-                                (dropPatternKeepFrames < framesLeft)
-                                    ? dropPatternKeepFrames
-                                    : framesLeft);
-
-                        const size_t sampleCount =
-                            static_cast<size_t>(sendFrames) * format->nChannels;
-                        const DWORD outputBytes =
-                            static_cast<DWORD>(sampleCount * sizeof(int16_t));
-                        const BYTE* segmentData =
-                            (data != nullptr)
-                                ? data + static_cast<size_t>(frameOffset) * format->nBlockAlign
-                                : nullptr;
-
-                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                            static BYTE zeroBuffer[64 * 1024]{};
-                            DWORD left = outputBytes;
-
-                            while (left > 0 && !g_stop.load()) {
-                                DWORD chunk =
-                                    (left < static_cast<DWORD>(sizeof(zeroBuffer)))
-                                        ? left
-                                        : static_cast<DWORD>(sizeof(zeroBuffer));
-                                if (!WriteChunk(request, zeroBuffer, chunk)) {
-                                    connected = false;
-                                    break;
-                                }
-
-                                ++successfulChunks;
-                                if (!streamConfirmed && successfulChunks >= 3) {
-                                    streamConfirmed = true;
-                                    autoReconnectAttempts = 0;
-                                    serviceRetryDelay = false;
-                                    retryAfterDelay = false;
-                                    std::wcout << L"Connected. Audio data flowing.\n";
-                                }
-
-                                left -= chunk;
-                            }
-                        } else if (segmentData != nullptr && sendFrames > 0) {
-                            if (!ConvertToS16(
-                                    segmentData,
-                                    sendFrames,
-                                    format,
-                                    sampleType,
-                                    pcm16)) {
-                                std::wcerr << L"PCM conversion failed.\n";
-                                connected = false;
-                            } else if (!WriteChunk(
-                                           request,
-                                           reinterpret_cast<const BYTE*>(pcm16.data()),
-                                           outputBytes)) {
-                                connected = false;
-                            } else {
-                                ++successfulChunks;
-                                if (!streamConfirmed && successfulChunks >= 3) {
-                                    streamConfirmed = true;
-                                    autoReconnectAttempts = 0;
-                                    serviceRetryDelay = false;
-                                    retryAfterDelay = false;
-                                    std::wcout << L"Connected. Audio data flowing.\n";
-                                }
-                            }
-                        }
-
-                        frameOffset += sendFrames;
-                        dropPatternKeepFrames -= sendFrames;
-
-                        if (!connected)
-                            break;
-
-                        if (dropPatternKeepFrames == 0) {
-                            uint64_t skipFrames =
-                                static_cast<uint64_t>(
-                                    (static_cast<uint64_t>(format->nSamplesPerSec) *
-                                     static_cast<uint64_t>(kDropPatternSkipMs)) /
-                                    1000ULL);
-
-                            if (skipFrames == 0)
-                                skipFrames = 1;
-
-                            dropPatternSkipFrames =
-                                (dropFrames < skipFrames) ? dropFrames : skipFrames;
-                        }
-
-                        continue;
-                    }
-
-                    if (dropPatternSkipFrames > 0) {
-                        // 这次只跳过一小段，跳过量计入待补偿预算。
-                        const UINT32 skipFrames =
-                            static_cast<UINT32>(
-                                (dropPatternSkipFrames < framesLeft)
-                                    ? dropPatternSkipFrames
-                                    : framesLeft);
+                    if (dropFrames > 0) {
+                        const uint64_t skip64 =
+                            std::min<uint64_t>(
+                                dropFrames,
+                                std::min<uint64_t>(
+                                    static_cast<uint64_t>(framesLeft),
+                                    dropUnitFrames));
+                        const UINT32 skipFrames = static_cast<UINT32>(skip64);
 
                         frameOffset += skipFrames;
-                        dropPatternSkipFrames -= skipFrames;
                         dropFrames -= skipFrames;
 
-                        if (dropPatternSkipFrames == 0 && dropFrames > 0) {
-                            dropPatternKeepFrames = static_cast<uint64_t>(
-                                (static_cast<uint64_t>(format->nSamplesPerSec) *
-                                 static_cast<uint64_t>(kDropPatternKeepMs)) /
-                                1000ULL);
-                            if (dropPatternKeepFrames == 0)
-                                dropPatternKeepFrames = 1;
+                        if (skipFrames > 0 && dropFrames == 0 && dropBacklogActive) {
+                            std::wcout << L"Drop backlog cleared.\n";
+                            dropBacklogActive = false;
                         }
 
+                        // 不插入保留段，下一轮立即继续丢。
                         continue;
                     }
 
-                    // 理论上不会走到这里；保险起见恢复正常状态。
-                    dropPatternKeepFrames = 0;
-                    dropPatternSkipFrames = 0;
+                    const UINT32 sendFrames = framesLeft;
+                    const size_t sampleCount =
+                        static_cast<size_t>(sendFrames) * format->nChannels;
+                    const DWORD outputBytes =
+                        static_cast<DWORD>(sampleCount * sizeof(int16_t));
+                    const BYTE* segmentData =
+                        (data != nullptr)
+                            ? data + static_cast<size_t>(frameOffset) * format->nBlockAlign
+                            : nullptr;
+
+                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                        static BYTE zeroBuffer[64 * 1024]{};
+                        DWORD left = outputBytes;
+
+                        while (left > 0 && !g_stop.load()) {
+                            DWORD chunk =
+                                (left < static_cast<DWORD>(sizeof(zeroBuffer)))
+                                    ? left
+                                    : static_cast<DWORD>(sizeof(zeroBuffer));
+
+                            if (!WriteChunk(request, zeroBuffer, chunk)) {
+                                connected = false;
+                                break;
+                            }
+
+                            ++successfulChunks;
+                            if (!streamConfirmed && successfulChunks >= 3) {
+                                streamConfirmed = true;
+                                autoReconnectAttempts = 0;
+                                serviceRetryDelay = false;
+                                retryAfterDelay = false;
+                                std::wcout << L"Connected. Audio data flowing.\n";
+                            }
+
+                            left -= chunk;
+                        }
+                    } else if (segmentData != nullptr && sendFrames > 0) {
+                        if (!ConvertToS16(
+                                segmentData,
+                                sendFrames,
+                                format,
+                                sampleType,
+                                pcm16)) {
+                            std::wcerr << L"PCM conversion failed.\n";
+                            connected = false;
+                        } else if (!WriteChunk(
+                                       request,
+                                       reinterpret_cast<const BYTE*>(pcm16.data()),
+                                       outputBytes)) {
+                            connected = false;
+                        } else {
+                            ++successfulChunks;
+                            if (!streamConfirmed && successfulChunks >= 3) {
+                                streamConfirmed = true;
+                                autoReconnectAttempts = 0;
+                                serviceRetryDelay = false;
+                                retryAfterDelay = false;
+                                std::wcout << L"Connected. Audio data flowing.\n";
+                            }
+                        }
+                    }
+
+                    frameOffset += sendFrames;
                 }
 
                 captureClient->ReleaseBuffer(frames);
@@ -1494,43 +1382,48 @@ int wmain(int argc, wchar_t* argv[])
                     break;
 
                 // 网络写入累计阻塞达到阈值时，不断开连接。
-                // 把阻塞时间换算成音频帧，下一批从 WASAPI buffer 中直接跳过这些旧帧。
-                // 这样相当于“快进”，让播放延迟回到正常水平。
+                // 全部累计阻塞时间都加入待丢预算，不再截断 200 ms。
+                // 按固定 20 ms 一轮连续丢弃：计算出轮数后连续执行，直到 dropFrames == 0。
                 if (g_blockedMs >= kDropBacklogMs) {
-                    const double dropMs =
-                        (g_blockedMs < 200.0) ? g_blockedMs : 200.0;
+                    const double dropMs = g_blockedMs;
 
                     const uint64_t newDropFrames =
                         static_cast<uint64_t>(
-                            format->nSamplesPerSec *
+                            static_cast<double>(format->nSamplesPerSec) *
                             dropMs / 1000.0);
 
                     dropFrames += newDropFrames;
 
-                    if (dropPatternKeepFrames == 0 &&
-                        dropPatternSkipFrames == 0) {
-                        dropPatternKeepFrames = static_cast<uint64_t>(
-                            (static_cast<uint64_t>(format->nSamplesPerSec) *
-                             static_cast<uint64_t>(kDropPatternKeepMs)) /
-                            1000ULL);
-                        if (dropPatternKeepFrames == 0)
-                            dropPatternKeepFrames = 1;
-                    }
+                    const uint64_t dropUnitFrames = std::max<uint64_t>(
+                        1,
+                        static_cast<uint64_t>(
+                            static_cast<double>(format->nSamplesPerSec) *
+                            kDropUnitMs / 1000.0));
+
+                    // 这里按“当前总欠账”计算需要连续丢多少个 20 ms 轮次。
+                    const uint64_t rounds =
+                        (dropFrames + dropUnitFrames - 1) / dropUnitFrames;
+                    const uint64_t remainderFrames =
+                        dropFrames % dropUnitFrames;
+
+                    const double backlogMs =
+                        static_cast<double>(dropFrames) * 1000.0 /
+                        static_cast<double>(format->nSamplesPerSec);
 
                     std::wcout
                         << L"Network congested (writes blocked "
-                        << static_cast<long long>(g_blockedMs)
-                        << L" ms); scheduling "
                         << static_cast<long long>(dropMs)
-                        << L" ms of old audio for periodic dropping (keep "
-                        << static_cast<long long>(kDropPatternKeepMs)
-                        << L" ms / drop "
-                        << static_cast<long long>(kDropPatternSkipMs)
-                        << L" ms).\n";
+                        << L" ms); queued "
+                        << static_cast<long long>(backlogMs)
+                        << L" ms to drop in "
+                        << static_cast<unsigned long long>(rounds)
+                        << L" consecutive 20 ms rounds"
+                        << (remainderFrames
+                            ? L" (last round is partial).\n"
+                            : L".\n");
 
-                    g_blockedMs -= dropMs;
-                    if (g_blockedMs < 0.0)
-                        g_blockedMs = 0.0;
+                    dropBacklogActive = true;
+                    g_blockedMs = 0.0;
                 }
 
                 hr = captureClient->GetNextPacketSize(
@@ -1596,8 +1489,7 @@ int wmain(int argc, wchar_t* argv[])
                 closeHttp();
                 stopAndFlushAudioCapture();
                 dropFrames = 0;
-                dropPatternKeepFrames = 0;
-                dropPatternSkipFrames = 0;
+                dropBacklogActive = false;
                 streamConfirmed = false;
 
                 ++autoReconnectAttempts;
