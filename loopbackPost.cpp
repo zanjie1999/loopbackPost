@@ -41,7 +41,7 @@ static constexpr auto kCongestionCooldown = std::chrono::seconds(3);
 
 // 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
 static constexpr auto kCongestionReconnectDelay =
-    std::chrono::milliseconds(150);
+    std::chrono::milliseconds(250);
 
 BOOL WINAPI ConsoleHandler(DWORD type)
 {
@@ -1041,10 +1041,27 @@ int wmain(int argc, wchar_t* argv[])
                 shortReconnectDelay = false;
 
                 if (!connected) {
-                    std::wcerr << L"Reconnect failed; audio capture remains stopped. Press Enter to retry.\n";
-                    retryAfterDelay = true;
+                    std::wcerr
+                        << L"Reconnect failed; audio capture remains stopped. Press Enter to retry.\n";
+
+                    // 自动重连失败后，不再继续循环重连。
+                    // 真正等用户按 Enter，避免网络波动时疯狂重连。
+                    retryAfterDelay = false;
+                    shortReconnectDelay = false;
                     congested = false;
                     g_blockedMs = 0.0;
+
+                    while (!g_stop.load()) {
+                        if (_kbhit() && _getch() == '\r') {
+                            // 用户主动重试也统一走 150 ms 的静音窗口，
+                            // 之后重新获取默认输出设备再建立连接。
+                            shortReconnectDelay = true;
+                            break;
+                        }
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
+                    }
+
                     continue;
                 }
 
