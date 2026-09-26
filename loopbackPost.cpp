@@ -80,8 +80,8 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     uc.dwExtraInfoLength = _countof(extra);
 
     // 只输入ip和端口时补充前缀和后缀
-    if (url.rfind(L"http", 0) != 0 &&
-        url = L"http://" + url + L"/aplay");
+    if (url.rfind(L"http", 0) != 0) {
+        url = L"http://" + url + L"/aplay";
     }
 
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
