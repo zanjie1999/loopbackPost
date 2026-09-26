@@ -27,6 +27,30 @@
 
 static std::atomic_bool g_stop{false};
 
+// ============ 拥塞检测 / 强制同步 ============
+// 思路：一次几 KB 的写入在局域网上本该在微秒级返回。要花掉毫秒级，
+// 只可能是 TCP 发送缓冲已经被写满、正等着对端消费 —— 换句话说，
+// 此刻下游至少积压了一个发送缓冲的数据。把这种“被挡住”的时间累计起来，
+// 超过阈值就主动断开重连，借服务端“断连即 kill aplay”的行为，
+// 把从 TCP 缓冲一直到最后 ALSA 缓冲的整条链路上的积压一次性清空。
+
+// 单次写入超过这个毫秒数，就认为它被写满的发送缓冲挡住了
+static constexpr double kBlockedWriteMs = 5.0;
+
+// 本次连接内累计“被挡住”的毫秒数
+static double g_blockedMs = 0.0;
+
+// 累计值超过这个阈值就触发重连
+static constexpr double kReconnectBlockedMs = 200.0;
+
+// 两次拥塞重连之间的冷却，避免网络持续抖动时疯狂重连
+static constexpr auto kCongestionCooldown = std::chrono::seconds(3);
+
+// 拥塞重连不等普通重连那 1 秒，但仍留一点时间让服务端把旧的 aplay
+// 杀掉、把 ALSA 设备放开，否则新的 aplay 可能打不开设备
+static constexpr auto kCongestionReconnectDelay =
+    std::chrono::milliseconds(150);
+
 BOOL WINAPI ConsoleHandler(DWORD type)
 {
     switch (type) {
@@ -61,7 +85,7 @@ struct UrlParts {
     bool https = false;
 };
 
-static bool CrackUrl(const std::wstring& inUrl, UrlParts& out)
+static bool CrackUrl(const std::wstring& url, UrlParts& out)
 {
     URL_COMPONENTS uc{};
     uc.dwStructSize = sizeof(uc);
@@ -79,13 +103,15 @@ static bool CrackUrl(const std::wstring& inUrl, UrlParts& out)
     uc.lpszExtraInfo = extra;
     uc.dwExtraInfoLength = _countof(extra);
 
+    // url 是 const 引用，不能直接改；拷一份到局部变量，在副本上做补全
+    std::wstring fullUrl = url;
+
     // 只输入ip和端口时补充前缀和后缀
-    std::wstring url = inUrl; 
-    if (url.rfind(L"http", 0) != 0) {
-        url = L"http://" + url + L"/aplay";
+    if (fullUrl.rfind(L"http", 0) != 0) {
+        fullUrl = L"http://" + fullUrl + L"/aplay";
     }
 
-    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
+    if (!WinHttpCrackUrl(fullUrl.c_str(), 0, 0, &uc)) {
         PrintWinError(L"WinHttpCrackUrl");
         return false;
     }
@@ -224,6 +250,8 @@ static bool WriteRaw(HINTERNET request,
     while (bytes > 0) {
         DWORD written = 0;
 
+        const auto writeStart = std::chrono::steady_clock::now();
+
         if (!WinHttpWriteData(
                 request,
                 data,
@@ -232,6 +260,13 @@ static bool WriteRaw(HINTERNET request,
             PrintWinError(L"WinHttpWriteData");
             return false;
         }
+
+        const double writeMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - writeStart).count();
+
+        if (writeMs > kBlockedWriteMs)
+            g_blockedMs += writeMs;
 
         if (written == 0) {
             std::wcerr
@@ -698,8 +733,28 @@ int wmain(int argc, wchar_t* argv[])
             return true;
         };
 
-        constexpr REFERENCE_TIME bufferDuration =
-            1000000; // 100 ms
+        // 共享模式下缓冲最终由音频引擎决定，我们只能“申请目标值”。
+        // 先问一下引擎周期，按它的整数倍去申请，免得因为没对齐被拒绝。
+        REFERENCE_TIME defaultPeriod = 0;
+        REFERENCE_TIME minPeriod = 0;
+
+        hr = audioClient->GetDevicePeriod(&defaultPeriod, &minPeriod);
+
+        if (FAILED(hr) || defaultPeriod <= 0)
+            defaultPeriod = 100000; // 问不到就按 10 ms 兜底
+
+        constexpr REFERENCE_TIME targetDuration = 300000; // 想要 30 ms
+
+        const REFERENCE_TIME bufferDuration =
+            ((targetDuration + defaultPeriod - 1) / defaultPeriod) *
+            defaultPeriod;
+
+        std::wcout
+            << L"Engine period: "
+            << defaultPeriod / 10000
+            << L" ms, requesting capture buffer: "
+            << bufferDuration / 10000
+            << L" ms\n";
 
         hr = audioClient->Initialize(
             AUDCLNT_SHAREMODE_SHARED,
@@ -714,6 +769,21 @@ int wmain(int argc, wchar_t* argv[])
                 L"IAudioClient::Initialize(loopback)",
                 hr);
             break;
+        }
+
+        // 共享模式下申请值不一定被采纳，把真实缓冲大小打出来，
+        // 这样才能知道这一项到底省下了多少延迟
+        UINT32 actualBufferFrames = 0;
+
+        if (SUCCEEDED(audioClient->GetBufferSize(&actualBufferFrames)) &&
+            format->nSamplesPerSec > 0) {
+            std::wcout
+                << L"Actual capture buffer: "
+                << actualBufferFrames
+                << L" frames ("
+                << (actualBufferFrames * 1000ULL) /
+                       format->nSamplesPerSec
+                << L" ms)\n";
         }
 
         hr = audioClient->GetService(
@@ -742,17 +812,29 @@ int wmain(int argc, wchar_t* argv[])
         std::vector<int16_t> pcm16;
 
         bool connected = false;
-        bool retryAfterDelay = false;
+        bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
+        bool congested = false;       // 拥塞触发的重连：只等一小会
+
+        auto lastCongestion =
+            std::chrono::steady_clock::now() - kCongestionCooldown;
 
         while (!g_stop.load()) {
             if (!connected) {
-                if (retryAfterDelay)
+                if (retryAfterDelay) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
+                } else if (congested) {
+                    std::this_thread::sleep_for(
+                        kCongestionReconnectDelay);
+                }
                 if (g_stop.load())
                     break;
+                if (congested)
+                    std::wcout << L"Reconnecting to resync...\n";
                 std::wcout << L"Connecting...\n";
                 connected = openHttp();
                 retryAfterDelay = false;
+                congested = false;
+                g_blockedMs = 0.0;
                 if (!connected) {
                     std::wcerr << L"Reconnect failed. Press Enter to retry.\n";
                     while (!g_stop.load()) {
@@ -878,6 +960,31 @@ int wmain(int argc, wchar_t* argv[])
                 if (!connected || g_stop.load())
                     break;
 
+                // 拥塞判定：本次连接累计“被挡住的写入时间”超过阈值，
+                // 说明下游已经积压了至少一个发送缓冲的数据。
+                // 断开重连会触发服务端 kill aplay，把整条链路的积压清空。
+                if (g_blockedMs >= kReconnectBlockedMs) {
+                    const auto now =
+                        std::chrono::steady_clock::now();
+
+                    if (now - lastCongestion >= kCongestionCooldown) {
+                        lastCongestion = now;
+
+                        std::wcout
+                            << L"Network congested (writes blocked "
+                            << static_cast<long long>(g_blockedMs)
+                            << L" ms); dropping the connection to flush the backlog.\n";
+
+                        connected = false;
+                        congested = true;
+                        break;
+                    }
+
+                    // 还在冷却期，先不重连；清零重新观察，
+                    // 免得冷却一结束就立刻又触发
+                    g_blockedMs = 0.0;
+                }
+
                 hr = captureClient->GetNextPacketSize(
                     &packetFrames);
 
@@ -891,9 +998,13 @@ int wmain(int argc, wchar_t* argv[])
             }
 
             if (!connected && !g_stop.load()) {
-                std::wcerr << L"Connection interrupted; retrying in 1 second.\n";
+                if (congested) {
+                    std::wcerr << L"Congestion reconnect; retrying now.\n";
+                } else {
+                    std::wcerr << L"Connection interrupted; retrying in 1 second.\n";
+                    retryAfterDelay = true;
+                }
                 closeHttp();
-                retryAfterDelay = true;
             }
         }
 
