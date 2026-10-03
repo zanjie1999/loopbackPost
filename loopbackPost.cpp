@@ -1402,12 +1402,12 @@ int wmain(int argc, wchar_t* argv[])
                     } else if (autoReconnectAttempts < kMaxAutoReconnectAttempts) {
                         std::wcerr
                             << L"HTTP connect failed; retrying in 1 second (attempt "
-                            << autoReconnectAttempts << L"/" << kMaxAutoReconnectAttempts << L").\n";
+                            << autoReconnectAttempts << L"/" << kMaxAutoReconnectAttempts << L")...\n";
                         retryAfterDelay = true;
                         shortReconnectDelay = false;
                     } else if (serviceMode) {
                         std::wcerr
-                            << L"Reconnect failed 3 times; retrying automatically in 10 seconds.\n";
+                            << L"Reconnect failed 3 times; retrying in 10 seconds.\n";
                         retryAfterDelay = false;
                         serviceRetryDelay = true;
                         shortReconnectDelay = false;
