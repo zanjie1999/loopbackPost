@@ -48,7 +48,7 @@ static void ResetWriteStats()
 }
 
 // 累计被阻塞到这个程度后，不重连，优先丢掉 WASAPI 捕获缓冲中的旧音频。
-static constexpr double kDropBacklogMs = 60.0;
+static double kDropBacklogMs = 60.0;
 
 // 拥塞补偿以 5 ms 为最小操作单位。
 // 不是连续“吃掉”缓存，而是在收到拥塞事件时预先计算一张
@@ -746,6 +746,11 @@ int wmain(int argc, wchar_t* argv[])
             << L"workdayAlarmClockGo URL end with /aplay: ";
 
         std::getline(std::wcin, url);
+    }
+
+    if (argc >= 3) {
+        // 第二个参数是同步延迟ms
+        kDropBacklogMs = std::wcstod(argv[2], nullptr);
     }
 
     if (url.empty()) {
