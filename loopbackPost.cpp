@@ -25,9 +25,19 @@
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winhttp.lib")
 
 static std::atomic_bool g_stop{false};
+static std::atomic_uint g_volumeUpRequests{0};
+static std::atomic_uint g_volumeDownRequests{0};
+static HHOOK g_keyboardHook = nullptr;
+static HANDLE g_keyboardHookReadyEvent = nullptr;
+static HANDLE g_keyboardHookStopEvent = nullptr;
+static HANDLE g_keyboardHookThread = nullptr;
+static DWORD g_keyboardHookError = ERROR_SUCCESS;
+static bool g_volumeUpPressed = false;
+static bool g_volumeDownPressed = false;
 
 // 单次写入超过 1 ms，才认为是实际发送阻塞并计入补偿欠账。
 static constexpr double kBlockedWriteMs = 1.0;
@@ -99,6 +109,176 @@ static void PrintHr(const wchar_t* where, HRESULT hr)
                << std::hex << static_cast<unsigned long>(hr) << std::dec << L"\n";
 }
 
+// 实现媒体按键音量键的拦截,实际控制音箱的音量
+static LRESULT CALLBACK LowLevelKeyboardProc(int code,
+                                              WPARAM message,
+                                              LPARAM data)
+{
+    if (code == HC_ACTION) {
+        const auto* key =
+            reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
+
+        if (key->vkCode == VK_VOLUME_UP) {
+            if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+                if (!g_volumeUpPressed) {
+                    g_volumeUpRequests.fetch_add(1);
+                    g_volumeUpPressed = true;
+                }
+                return 1;
+            }
+
+            if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+                g_volumeUpPressed = false;
+                return 1;
+            }
+        } else if (key->vkCode == VK_VOLUME_DOWN) {
+            if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+                if (!g_volumeDownPressed) {
+                    g_volumeDownRequests.fetch_add(1);
+                    g_volumeDownPressed = true;
+                }
+                return 1;
+            }
+
+            if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+                g_volumeDownPressed = false;
+                return 1;
+            }
+        }
+    }
+
+    return CallNextHookEx(g_keyboardHook, code, message, data);
+}
+
+static DWORD WINAPI KeyboardHookThreadProc(void*)
+{
+    MSG message{};
+    PeekMessageW(&message, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    g_keyboardHook = SetWindowsHookExW(
+        WH_KEYBOARD_LL,
+        LowLevelKeyboardProc,
+        GetModuleHandleW(nullptr),
+        0);
+
+    if (!g_keyboardHook)
+        g_keyboardHookError = GetLastError();
+
+    SetEvent(g_keyboardHookReadyEvent);
+
+    if (!g_keyboardHook)
+        return 1;
+
+    for (;;) {
+        const DWORD waitResult = MsgWaitForMultipleObjects(
+            1,
+            &g_keyboardHookStopEvent,
+            FALSE,
+            INFINITE,
+            QS_ALLINPUT);
+
+        if (waitResult == WAIT_OBJECT_0)
+            break;
+
+        if (waitResult == WAIT_OBJECT_0 + 1) {
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+                if (message.message == WM_QUIT)
+                    goto finished;
+
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            continue;
+        }
+
+        PrintWinError(L"MsgWaitForMultipleObjects(keyboard hook)");
+        break;
+    }
+
+finished:
+    if (!UnhookWindowsHookEx(g_keyboardHook))
+        PrintWinError(L"UnhookWindowsHookEx");
+    g_keyboardHook = nullptr;
+    return 0;
+}
+
+static bool StartKeyboardHook()
+{
+    g_keyboardHookReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_keyboardHookReadyEvent) {
+        PrintWinError(L"CreateEvent(keyboard hook ready)");
+        return false;
+    }
+
+    g_keyboardHookStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_keyboardHookStopEvent) {
+        PrintWinError(L"CreateEvent(keyboard hook stop)");
+        CloseHandle(g_keyboardHookReadyEvent);
+        g_keyboardHookReadyEvent = nullptr;
+        return false;
+    }
+
+    g_keyboardHookThread = CreateThread(
+        nullptr,
+        0,
+        KeyboardHookThreadProc,
+        nullptr,
+        0,
+        nullptr);
+
+    if (!g_keyboardHookThread) {
+        PrintWinError(L"CreateThread(keyboard hook)");
+        CloseHandle(g_keyboardHookStopEvent);
+        CloseHandle(g_keyboardHookReadyEvent);
+        g_keyboardHookStopEvent = nullptr;
+        g_keyboardHookReadyEvent = nullptr;
+        return false;
+    }
+
+    const DWORD waitResult =
+        WaitForSingleObject(g_keyboardHookReadyEvent, INFINITE);
+    if (waitResult != WAIT_OBJECT_0) {
+        if (waitResult == WAIT_FAILED)
+            PrintWinError(L"WaitForSingleObject(keyboard hook ready)");
+        else
+            std::wcerr << L"Unexpected keyboard hook startup wait result.\n";
+    } else if (g_keyboardHook) {
+        std::wcout
+            << L"Media volume keys are captured; system volume will not change.\n";
+        return true;
+    } else {
+        PrintWinError(L"SetWindowsHookEx(WH_KEYBOARD_LL)", g_keyboardHookError);
+    }
+
+    SetEvent(g_keyboardHookStopEvent);
+    if (WaitForSingleObject(g_keyboardHookThread, INFINITE) != WAIT_OBJECT_0)
+        PrintWinError(L"WaitForSingleObject(keyboard hook thread)");
+    CloseHandle(g_keyboardHookThread);
+    CloseHandle(g_keyboardHookStopEvent);
+    CloseHandle(g_keyboardHookReadyEvent);
+    g_keyboardHookThread = nullptr;
+    g_keyboardHookStopEvent = nullptr;
+    g_keyboardHookReadyEvent = nullptr;
+    return false;
+}
+
+static void StopKeyboardHook()
+{
+    if (!g_keyboardHookThread)
+        return;
+
+    if (!SetEvent(g_keyboardHookStopEvent))
+        PrintWinError(L"SetEvent(keyboard hook stop)");
+
+    if (WaitForSingleObject(g_keyboardHookThread, INFINITE) != WAIT_OBJECT_0)
+        PrintWinError(L"WaitForSingleObject(keyboard hook thread)");
+    CloseHandle(g_keyboardHookThread);
+    CloseHandle(g_keyboardHookStopEvent);
+    CloseHandle(g_keyboardHookReadyEvent);
+    g_keyboardHookThread = nullptr;
+    g_keyboardHookStopEvent = nullptr;
+    g_keyboardHookReadyEvent = nullptr;
+}
+
 struct UrlParts {
     std::wstring host;
     std::wstring path;
@@ -124,12 +304,11 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     uc.lpszExtraInfo = extra;
     uc.dwExtraInfoLength = _countof(extra);
 
-    // url 是 const 引用，不能直接改；拷一份到局部变量，在副本上做补全
     std::wstring fullUrl = url;
 
-    // 只输入ip和端口时补充前缀和后缀
+    // 没有 scheme 时按 HTTP 处理，路径则在解析后单独补齐。
     if (fullUrl.rfind(L"http", 0) != 0) {
-        fullUrl = L"http://" + fullUrl + L"/aplay";
+        fullUrl = L"http://" + fullUrl;
     }
 
     if (!WinHttpCrackUrl(fullUrl.c_str(), 0, 0, &uc)) {
@@ -150,7 +329,10 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
     if (uc.dwUrlPathLength > 0)
         out.path.assign(path, uc.dwUrlPathLength);
     else
-        out.path = L"/";
+        out.path = L"/aplay";
+
+    if (out.path == L"/")
+        out.path = L"/aplay";
 
     if (uc.dwExtraInfoLength > 0)
         out.path.append(extra, uc.dwExtraInfoLength);
@@ -383,6 +565,39 @@ static bool SendVolumeRequest(const UrlParts& source,
     WinHttpCloseHandle(session);
 
     return ok;
+}
+
+static void HandlePendingVolumeRequests(const UrlParts& parts)
+{
+    const unsigned int upRequests = g_volumeUpRequests.exchange(0);
+    const unsigned int downRequests = g_volumeDownRequests.exchange(0);
+
+    for (unsigned int i = 0; i < upRequests; ++i) {
+        if (SendVolumeRequest(parts, L"/volp"))
+            std::wcout << L"Volume up.\n";
+    }
+
+    for (unsigned int i = 0; i < downRequests; ++i) {
+        if (SendVolumeRequest(parts, L"/volm"))
+            std::wcout << L"Volume down.\n";
+    }
+}
+
+static void SleepWhileHandlingVolumeRequests(
+    std::chrono::milliseconds duration,
+    const UrlParts& parts)
+{
+    const auto end = std::chrono::steady_clock::now() + duration;
+
+    while (!g_stop.load()) {
+        HandlePendingVolumeRequests(parts);
+
+        const auto remaining = end - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero())
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }
 
 static bool ReadHttpResponse(HINTERNET request,
@@ -789,6 +1004,7 @@ int wmain(int argc, wchar_t* argv[])
     WAVEFORMATEX* format = nullptr;
 
     bool ok = false;
+    bool keyboardHookStarted = false;
 
     do {
         hr = CoCreateInstance(
@@ -902,6 +1118,10 @@ int wmain(int argc, wchar_t* argv[])
         // 当前实际使用的地址。302 时优先使用 Location；如果服务端只做 8080 -> 8880，
         // 也会自动切换到 8880。
         UrlParts activeParts = finalParts;
+
+        if (!StartKeyboardHook())
+            break;
+        keyboardHookStarted = true;
 
         std::wcout
             << L"Output format: "
@@ -1369,14 +1589,22 @@ int wmain(int argc, wchar_t* argv[])
         };
 
         while (!g_stop.load()) {
+            HandlePendingVolumeRequests(activeParts);
+
             if (!connected) {
                 if (serviceRetryDelay) {
-                    std::this_thread::sleep_for(kServiceRetryDelay);
+                    SleepWhileHandlingVolumeRequests(
+                        kServiceRetryDelay,
+                        activeParts);
                 } else if (retryAfterDelay) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    SleepWhileHandlingVolumeRequests(
+                        std::chrono::seconds(1),
+                        activeParts);
                 } else if (shortReconnectDelay) {
                     // 200 ms 等待期间采集已经 Stop+Reset，因此不会产生新的音频积压。
-                    std::this_thread::sleep_for(kCongestionReconnectDelay);
+                    SleepWhileHandlingVolumeRequests(
+                        kCongestionReconnectDelay,
+                        activeParts);
                 }
 
                 if (g_stop.load())
@@ -1422,6 +1650,7 @@ int wmain(int argc, wchar_t* argv[])
                         retryAfterDelay = false;
                         shortReconnectDelay = false;
                         while (!g_stop.load()) {
+                            HandlePendingVolumeRequests(activeParts);
                             if (_kbhit() && _getch() == '\r') {
                                 autoReconnectAttempts = 0;
                                 shortReconnectDelay = true;
@@ -1887,6 +2116,7 @@ int wmain(int argc, wchar_t* argv[])
                     shortReconnectDelay = false;
 
                     while (!g_stop.load()) {
+                        HandlePendingVolumeRequests(activeParts);
                         if (_kbhit() && _getch() == '\r') {
                             autoReconnectAttempts = 0;
                             shortReconnectDelay = true;
@@ -1906,6 +2136,9 @@ int wmain(int argc, wchar_t* argv[])
         closeHttp();
 
     } while (false);
+
+    if (keyboardHookStarted)
+        StopKeyboardHook();
 
     if (format)
         CoTaskMemFree(format);

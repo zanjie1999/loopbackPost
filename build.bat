@@ -6,5 +6,5 @@ if errorlevel 1 (
   echo Run this from a Visual Studio Developer Command Prompt.
   exit /b 1
 )
-cl /nologo /EHsc /std:c++17 /O2 /MT loopbackPost.cpp /Fe:loopbackPost.exe /link winhttp.lib ole32.lib uuid.lib
+cl /nologo /EHsc /std:c++17 /O2 /MT loopbackPost.cpp /Fe:loopbackPost.exe /link winhttp.lib ole32.lib uuid.lib user32.lib
 endlocal
