@@ -31,6 +31,7 @@
 static std::atomic_bool g_stop{false};
 static std::atomic_uint g_volumeUpRequests{0};
 static std::atomic_uint g_volumeDownRequests{0};
+static std::atomic_bool g_reconnectRequested{false};
 static HHOOK g_keyboardHook = nullptr;
 static HANDLE g_keyboardHookReadyEvent = nullptr;
 static HANDLE g_keyboardHookStopEvent = nullptr;
@@ -38,6 +39,7 @@ static HANDLE g_keyboardHookThread = nullptr;
 static DWORD g_keyboardHookError = ERROR_SUCCESS;
 static bool g_volumeUpPressed = false;
 static bool g_volumeDownPressed = false;
+static bool g_volumeMutePressed = false;
 
 // 单次写入超过 1 ms，才认为是实际发送阻塞并计入补偿欠账。
 static constexpr double kBlockedWriteMs = 1.0;
@@ -142,6 +144,19 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code,
 
             if (message == WM_KEYUP || message == WM_SYSKEYUP) {
                 g_volumeDownPressed = false;
+                return 1;
+            }
+        } else if (key->vkCode == VK_VOLUME_MUTE) {
+            if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) {
+                if (!g_volumeMutePressed) {
+                    g_reconnectRequested.store(true);
+                    g_volumeMutePressed = true;
+                }
+                return 1;
+            }
+
+            if (message == WM_KEYUP || message == WM_SYSKEYUP) {
+                g_volumeMutePressed = false;
                 return 1;
             }
         }
@@ -1651,7 +1666,8 @@ int wmain(int argc, wchar_t* argv[])
                         shortReconnectDelay = false;
                         while (!g_stop.load()) {
                             HandlePendingVolumeRequests(activeParts);
-                            if (_kbhit() && _getch() == '\r') {
+                            if ((_kbhit() && _getch() == '\r') ||
+                                g_reconnectRequested.exchange(false)) {
                                 autoReconnectAttempts = 0;
                                 shortReconnectDelay = true;
                                 break;
@@ -1687,11 +1703,14 @@ int wmain(int argc, wchar_t* argv[])
                     << L"HTTP connected; waiting for audio writes...\n";
             }
 
-            if (_kbhit()) {
-                const int key = _getch();
+            const bool reconnectRequested =
+                g_reconnectRequested.exchange(false);
+            const bool consoleKeyAvailable = _kbhit() != 0;
+            if (consoleKeyAvailable || reconnectRequested) {
+                const int key = consoleKeyAvailable ? _getch() : 0;
 
                 // Windows 控制台方向键：0/224 后跟具体键值，↑=72，↓=80。
-                if (key == 0 || key == 224) {
+                if (!reconnectRequested && (key == 0 || key == 224)) {
                     const int arrow = _getch();
 
                     if (arrow == 72) {
@@ -1707,32 +1726,31 @@ int wmain(int argc, wchar_t* argv[])
                     continue;
                 }
 
-                if (key == '\r') {
+                if (key == '\r' || reconnectRequested) {
                     std::wcout << L"Reconnect requested; flushing capture and refreshing audio output device.\n";
-                closeHttp();
-                connected = false;
-                streamConfirmed = false;
-                successfulChunks = 0;
-                autoReconnectAttempts = 0;
-                retryAfterDelay = false;
-                serviceRetryDelay = false;
-                shortReconnectDelay = true;
-                clearCompensation();
-                haveLastCongestionTime = false;
-                avgCongestionIntervalMs = kInitialCongestionIntervalMs;
+                    closeHttp();
+                    connected = false;
+                    streamConfirmed = false;
+                    successfulChunks = 0;
+                    autoReconnectAttempts = 0;
+                    retryAfterDelay = false;
+                    serviceRetryDelay = false;
+                    shortReconnectDelay = true;
+                    clearCompensation();
+                    haveLastCongestionTime = false;
+                    avgCongestionIntervalMs = kInitialCongestionIntervalMs;
 
-                // 立刻 Stop+Reset 清掉当前捕获积压，然后等 200 ms。
-                // 这 200 ms 内采集保持停止，绝不会继续往 WASAPI buffer 里堆数据。
-                if (!stopAndFlushAudioCapture()) {
-                    std::wcerr
-                        << L"Failed to flush audio capture; will rebuild it during reconnect.\n";
-                }
+                    // Stop+Reset 丢弃当前捕获积压，并给服务端时间释放旧连接。
+                    if (!stopAndFlushAudioCapture()) {
+                        std::wcerr
+                            << L"Failed to flush audio capture; will rebuild it during reconnect.\n";
+                    }
 
-                clearCompensation();
-                haveLastCongestionTime = false;
-                avgCongestionIntervalMs = kInitialCongestionIntervalMs;
-                ResetWriteStats();
-                continue;
+                    clearCompensation();
+                    haveLastCongestionTime = false;
+                    avgCongestionIntervalMs = kInitialCongestionIntervalMs;
+                    ResetWriteStats();
+                    continue;
                 }
             }
 
@@ -2117,7 +2135,8 @@ int wmain(int argc, wchar_t* argv[])
 
                     while (!g_stop.load()) {
                         HandlePendingVolumeRequests(activeParts);
-                        if (_kbhit() && _getch() == '\r') {
+                        if ((_kbhit() && _getch() == '\r') ||
+                            g_reconnectRequested.exchange(false)) {
                             autoReconnectAttempts = 0;
                             shortReconnectDelay = true;
                             break;
