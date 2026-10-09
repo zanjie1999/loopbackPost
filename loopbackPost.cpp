@@ -299,7 +299,70 @@ struct UrlParts {
     std::wstring path;
     INTERNET_PORT port = 0;
     bool https = false;
+    bool portSpecified = false;
 };
+
+static bool HasExplicitPort(const std::wstring& url) {
+    const size_t schemeEnd = url.find(L"://");
+    const size_t authorityBegin =
+        schemeEnd == std::wstring::npos ? 0 : schemeEnd + 3;
+    const size_t authorityEnd =
+        url.find_first_of(L"/?#", authorityBegin);
+    std::wstring authority = url.substr(
+        authorityBegin,
+        authorityEnd == std::wstring::npos
+            ? std::wstring::npos
+            : authorityEnd - authorityBegin);
+
+    const size_t userInfoEnd = authority.rfind(L'@');
+    if (userInfoEnd != std::wstring::npos) {
+        authority.erase(0, userInfoEnd + 1);
+    }
+
+    size_t portSeparator = std::wstring::npos;
+    if (!authority.empty() && authority.front() == L'[') {
+        const size_t hostEnd = authority.find(L']');
+        if (hostEnd != std::wstring::npos &&
+            hostEnd + 1 < authority.size() &&
+            authority[hostEnd + 1] == L':') {
+            portSeparator = hostEnd + 1;
+        }
+    } else {
+        portSeparator = authority.rfind(L':');
+    }
+
+    if (portSeparator == std::wstring::npos ||
+        portSeparator + 1 == authority.size()) {
+        return false;
+    }
+
+    return std::all_of(
+        authority.begin() + portSeparator + 1,
+        authority.end(),
+        [](wchar_t c) { return c >= L'0' && c <= L'9'; });
+}
+
+static bool IsConnectionFailure(DWORD error) {
+    return error == ERROR_WINHTTP_CANNOT_CONNECT ||
+           error == ERROR_WINHTTP_CONNECTION_ERROR ||
+           error == ERROR_WINHTTP_TIMEOUT;
+}
+
+static bool AdvancePortFallback(UrlParts& parts) {
+    if (parts.https) {
+        return false;
+    }
+
+    if (!parts.portSpecified && parts.port == INTERNET_DEFAULT_HTTP_PORT) {
+        parts.port = 8080;
+    } else if (parts.port == 8080) {
+        parts.port = 8880;
+    } else {
+        return false;
+    }
+
+    return true;
+}
 
 static bool CrackUrl(const std::wstring& url, UrlParts& out)
 {
@@ -333,6 +396,7 @@ static bool CrackUrl(const std::wstring& url, UrlParts& out)
 
     out.https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
     out.port = uc.nPort;
+    out.portSpecified = HasExplicitPort(fullUrl);
 
     if (uc.dwHostNameLength == 0) {
         std::wcerr << L"Invalid URL: missing host.\n";
@@ -453,7 +517,7 @@ static std::wstring BuildAudioUrl(const std::wstring& originalUrl,
         (!parts.https &&
          parts.port == INTERNET_DEFAULT_HTTP_PORT);
 
-    if (!defaultPort)
+    if (!defaultPort || parts.portSpecified)
         result += L":" + std::to_wstring(parts.port);
 
     result += parts.path;
@@ -1157,33 +1221,61 @@ int wmain(int argc, wchar_t* argv[])
         };
 
         const auto openHttp = [&]() -> bool {
-            closeHttp();
-            session = WinHttpOpen(
-                L"workdayAlarmClockGo/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-            if (!session) { PrintWinError(L"WinHttpOpen"); return false; }
-            // 设置超时：Resolve、Connect、Send、Receive
-            WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
-            connect = WinHttpConnect(session, activeParts.host.c_str(), activeParts.port, 0);
-            if (!connect) { PrintWinError(L"WinHttpConnect"); closeHttp(); return false; }
-            request = WinHttpOpenRequest(
-                connect, L"PUT", activeParts.path.c_str(), nullptr,
-                WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                finalParts.https ? WINHTTP_FLAG_SECURE : 0);
-            if (!request) { PrintWinError(L"WinHttpOpenRequest"); closeHttp(); return false; }
-            const wchar_t headers[] =
-                L"Content-Type: application/octet-stream\r\n"
-                L"Content-Length: 68719476735\r\n"
-                L"Expect: 100-continue\r\n";
-            if (!WinHttpSendRequest(
-                    request, headers, static_cast<DWORD>(-1),
-                    WINHTTP_NO_REQUEST_DATA, 0,
-                    WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH, 0)) {
-                PrintWinError(L"WinHttpSendRequest");
+            for (;;) {
                 closeHttp();
+                DWORD failureError = ERROR_SUCCESS;
+
+                session = WinHttpOpen(
+                    L"workdayAlarmClockGo/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+                if (!session) {
+                    failureError = GetLastError();
+                    PrintWinError(L"WinHttpOpen", failureError);
+                } else {
+                    // 设置超时：Resolve、Connect、Send、Receive
+                    WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
+                    connect = WinHttpConnect(
+                        session,
+                        activeParts.host.c_str(),
+                        activeParts.port,
+                        0);
+                    if (!connect) {
+                        failureError = GetLastError();
+                        PrintWinError(L"WinHttpConnect", failureError);
+                    } else {
+                        request = WinHttpOpenRequest(
+                            connect, L"PUT", activeParts.path.c_str(), nullptr,
+                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                            finalParts.https ? WINHTTP_FLAG_SECURE : 0);
+                        if (!request) {
+                            failureError = GetLastError();
+                            PrintWinError(L"WinHttpOpenRequest", failureError);
+                        } else {
+                            const wchar_t headers[] =
+                                L"Content-Type: application/octet-stream\r\n"
+                                L"Content-Length: 68719476735\r\n"
+                                L"Expect: 100-continue\r\n";
+                            if (WinHttpSendRequest(
+                                    request, headers, static_cast<DWORD>(-1),
+                                    WINHTTP_NO_REQUEST_DATA, 0,
+                                    WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH, 0)) {
+                                return true;
+                            }
+                            failureError = GetLastError();
+                            PrintWinError(L"WinHttpSendRequest", failureError);
+                        }
+                    }
+                }
+                closeHttp();
+                if (IsConnectionFailure(failureError) &&
+                    AdvancePortFallback(activeParts)) {
+                    std::wcout
+                        << L"Cannot connect; trying port "
+                        << activeParts.port << L".\n";
+                    continue;
+                }
                 return false;
             }
-            return true;
         };
 
         // 重连时只 Stop + Reset，不要在这里 Start。
@@ -2056,6 +2148,7 @@ int wmain(int argc, wchar_t* argv[])
                 DWORD httpStatus = 0;
                 std::string responseBody;
                 std::wstring location;
+                bool portFallbackApplied = false;
 
                 // WinHttpWriteData 失败时，服务端可能已经返回 404/500/302。
                 // 尝试把响应读出来，至少把状态码和 JSON 错误打印给用户。
@@ -2084,20 +2177,22 @@ int wmain(int argc, wchar_t* argv[])
                                     << (activeParts.https ? L"https://" : L"http://")
                                     << activeParts.host << L":" << activeParts.port
                                     << activeParts.path << L"\n";
-                            } else if (activeParts.port == 8080) {
-                                activeParts.port = 8880;
+                            } else if (AdvancePortFallback(activeParts)) {
+                                portFallbackApplied = true;
                                 std::wcout
-                                    << L"HTTP redirect detected; switching port 8080 -> 8880.\n";
+                                    << L"HTTP redirect detected; trying port "
+                                    << activeParts.port << L".\n";
                             }
                         }
                     }
                 }
 
-                if (g_lastWinHttpError == ERROR_WINHTTP_CONNECTION_ERROR &&
-                    activeParts.port == 8080) {
-                    activeParts.port = 8880;
+                if (!portFallbackApplied &&
+                    IsConnectionFailure(g_lastWinHttpError) &&
+                    AdvancePortFallback(activeParts)) {
                     std::wcout
-                        << L"WinHTTP connection error on port 8080; trying port 8880.\n";
+                        << L"WinHTTP connection error; trying port "
+                        << activeParts.port << L".\n";
                 }
 
                 closeHttp();
