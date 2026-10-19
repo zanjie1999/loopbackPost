@@ -54,8 +54,13 @@ static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 
 // 允许的最大音频年龄（毫秒）。用 WASAPI 时间戳算出的“这段音频现在有多旧”，
 // 超过就从这段音频开头丢弃，只发最新的部分，保证下位机收到的一定是新的。
-// 延迟补偿由下位机负责，上游只负责“别发旧的”。
+// 实测正常播放时 age 在 -8~5ms 之间波动，所以 10ms 足够宽松，
+// 一旦明显超出就说明链路或进程卡了，必须丢。
 static double kDropBacklogMs = 20.0;
+
+// WASAPI 采集周期（毫秒）。0 表示用驱动报告的默认/最小周期。
+// 调大后每次 GetBuffer 拿到的音频更多、唤醒次数更少，抗抖动更稳，延迟略增。
+static double kCapturePeriodMs = 0.0;
 
 // 队列硬上限（毫秒音频），只用来兜住服务端彻底卡死的病态情况。
 static double kDropAllBacklogMs = 500.0;
@@ -145,6 +150,16 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
         PrintHr(L"QueryInterface(IAudioClient3)", hr);
     }
 
+    // 命令行显式指定了采集周期就用它，否则沿用上面查到的默认值。
+    // 周期调大后每次 GetBuffer 拿到的音频更多、唤醒次数更少，
+    // 抗调度抖动更稳，代价是延迟略增。
+    if (kCapturePeriodMs > 0.0) {
+        bufferDuration = static_cast<REFERENCE_TIME>(
+            kCapturePeriodMs * 10000.0);
+        if (bufferDuration < 10000)  // 至少 1ms，避免非法值
+            bufferDuration = 10000;
+    }
+
     const auto reactivateAudioClient = [&]() -> bool {
         (*audioClient)->Release();
         *audioClient = nullptr;
@@ -213,7 +228,10 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
         std::wcout << L"IAudioClient3 period query unavailable, requesting ";
     }
     std::wcout << (static_cast<double>(bufferDuration) / 10000.0)
-               << L" ms\n";
+               << L" ms";
+    if (kCapturePeriodMs > 0.0)
+        std::wcout << L" (from argv[2])";
+    std::wcout << L"\n";
     return true;
 }
 
@@ -1179,14 +1197,22 @@ int wmain(int argc, wchar_t* argv[])
         std::getline(std::wcin, url);
     }
 
+    // 命令行参数：
+    //   argv[1] 目标地址
+    //   argv[2] WASAPI 采集周期 ms（0 或省略 = 用驱动默认值）
+    //   argv[3] 允许的最大音频年龄 ms，超过就丢旧音频
+    //   argv[4] 队列硬上限 ms（兜底，正常不该触发）
+
     if (argc >= 3) {
-        // 第2个参数是允许的最大采集音频年龄ms
-        kDropBacklogMs = std::wcstod(argv[2], nullptr);
+        kCapturePeriodMs = std::wcstod(argv[2], nullptr);
     }
 
     if (argc >= 4) {
-        // 第3个参数是达到多少ms丢全部
-        kDropAllBacklogMs = std::wcstod(argv[3], nullptr);
+        kDropBacklogMs = std::wcstod(argv[3], nullptr);
+    }
+
+    if (argc >= 5) {
+        kDropAllBacklogMs = std::wcstod(argv[4], nullptr);
     }
 
     if (url.empty()) {
@@ -1703,6 +1729,37 @@ int wmain(int argc, wchar_t* argv[])
         // 只留最新的部分。这样无论积压来自 WASAPI 缓冲、本进程队列，
         // 还是已经堵在链路里的数据，都被同一把绝对时间的尺子量到，
         // 保证发出去的音频一定是新鲜的。
+        // WASAPI 时间戳与本地 QPC 之间存在固定偏移（loopback 拿到的是已播放
+        // 音频，时间戳标记的是它在设备时间线上的位置）。用第一个包校准一次，
+        // 之后所有 age 计算都减掉这个偏移，让日志里的 age 反映真实延迟。
+        bool qpcOffsetValid = false;
+        double qpcOffset100ns = 0.0;
+
+        // 把 WASAPI 时间戳换算成“这段音频现在有多旧”（毫秒）。
+        // 返回值已经扣掉校准偏移；偏移尚未建立时返回 0（不丢）。
+        const auto computeAgeMs = [&](UINT64 qpcStart,
+                                      UINT32 frames) -> double {
+            LARGE_INTEGER nowQpc{};
+            if (!QueryPerformanceCounter(&nowQpc))
+                return 0.0;
+
+            const double now100ns =
+                static_cast<double>(nowQpc.QuadPart) * 10000000.0 /
+                static_cast<double>(qpcFrequency.QuadPart);
+            const double end100ns =
+                static_cast<double>(qpcStart) +
+                static_cast<double>(frames) * 10000000.0 /
+                    static_cast<double>(format->nSamplesPerSec);
+
+            // 第一个包用来建立偏移：此时认为这段音频“刚好是实时的”。
+            if (!qpcOffsetValid) {
+                qpcOffset100ns = end100ns - now100ns;
+                qpcOffsetValid = true;
+            }
+
+            return (now100ns + qpcOffset100ns - end100ns) / 10000.0;
+        };
+
         const auto enqueuePcm = [&](const std::vector<int16_t>& pcm,
                                     UINT64 qpcStart,
                                     UINT32 frames,
@@ -1716,63 +1773,57 @@ int wmain(int argc, wchar_t* argv[])
             UINT64 keepQpcStart = qpcStart;
 
             if (hasTimestamp && format->nSamplesPerSec > 0) {
-                LARGE_INTEGER nowQpc{};
-                if (QueryPerformanceCounter(&nowQpc)) {
-                    const double now100ns =
-                        static_cast<double>(nowQpc.QuadPart) * 10000000.0 /
-                        static_cast<double>(qpcFrequency.QuadPart);
+                const double ageMs = computeAgeMs(qpcStart, frames);
+                if (ageMs > kDropBacklogMs) {
+                    // 超出阈值多少毫秒，就从这段音频开头丢掉多少。
+                    const double excessMs = ageMs - kDropBacklogMs;
+                    uint64_t dropFrames = static_cast<uint64_t>(
+                        std::ceil(excessMs * format->nSamplesPerSec /
+                                  1000.0));
 
-                    // 这段音频的结束时刻，以及它已经等了多久。
-                    const double end100ns =
-                        static_cast<double>(qpcStart) +
-                        static_cast<double>(frames) * 10000000.0 /
-                            static_cast<double>(format->nSamplesPerSec);
-                    const double ageMs = (now100ns - end100ns) / 10000.0;
-
-                    if (ageMs > kDropBacklogMs) {
-                        // 超出阈值多少毫秒，就从这段音频开头丢掉多少。
-                        const double excessMs = ageMs - kDropBacklogMs;
-                        uint64_t dropFrames = static_cast<uint64_t>(
-                            std::ceil(excessMs * format->nSamplesPerSec /
-                                      1000.0));
-
-                        if (dropFrames >= frames) {
-                            // 整段都太旧，直接扔掉。
-                            std::wcout
-                                << L"Stale packet (" 
-                                << static_cast<long long>(ageMs)
-                                << L" ms old); dropped entirely.\n";
-                            return;
-                        }
-
-                        const size_t dropBytes =
-                            static_cast<size_t>(dropFrames) *
-                            static_cast<size_t>(format->nChannels) *
-                            sizeof(int16_t);
-                        bytes += dropBytes;
-                        size -= dropBytes;
-                        keepFrames = frames - static_cast<UINT32>(dropFrames);
-                        keepQpcStart =
-                            qpcStart +
-                            static_cast<UINT64>(
-                                static_cast<double>(dropFrames) * 10000000.0 /
-                                static_cast<double>(format->nSamplesPerSec));
-
-                        if (!captureDropActive) {
-                            std::wcout << L"Audio " 
-                                       << static_cast<long long>(ageMs)
-                                       << L" ms old; dropped "
-                                       << static_cast<long long>(excessMs)
-                                       << L" ms to catch up.\n";
-                            captureDropActive = true;
-                        }
-                    } else if (captureDropActive) {
-                        std::wcout << L"Audio age back to normal.\n";
-                        captureDropActive = false;
+                    if (dropFrames >= frames) {
+                        // 整段都太旧，直接扔掉。
+                        std::wcout
+                            << L"Stale packet (" 
+                            << static_cast<long long>(ageMs)
+                            << L" ms old); dropped entirely.\n";
+                        return;
                     }
+
+                    const size_t dropBytes =
+                        static_cast<size_t>(dropFrames) *
+                        static_cast<size_t>(format->nChannels) *
+                        sizeof(int16_t);
+                    bytes += dropBytes;
+                    size -= dropBytes;
+                    keepFrames = frames - static_cast<UINT32>(dropFrames);
+                    keepQpcStart =
+                        qpcStart +
+                        static_cast<UINT64>(
+                            static_cast<double>(dropFrames) * 10000000.0 /
+                            static_cast<double>(format->nSamplesPerSec));
+
+                    if (!captureDropActive) {
+                        std::wcout << L"Audio " 
+                                   << static_cast<long long>(ageMs)
+                                   << L" ms old; dropped "
+                                   << static_cast<long long>(excessMs)
+                                   << L" ms to catch up.\n";
+                        captureDropActive = true;
+                    }
+                } else if (captureDropActive) {
+                    std::wcout << L"Audio age back to normal.\n";
+                    captureDropActive = false;
                 }
             }
 
+            // 入队，然后从队头砍掉已经太旧的音频。
+            //
+            // 只检查“新到的这一包”是不够的：写调用阻塞期间，采集线程会继续
+            // 把当时还很新的包塞进队列，它们入队时 age≈0 不触发丢弃，
+            // 但会在队列里越放越旧。而发送速率等于实时速率，永远追不回来。
+            // 所以必须回头检查队列头，把旧的砍掉，保证队列里只剩新鲜音频。
+            double staleDroppedMs = 0.0;
             {
                 std::lock_guard<std::mutex> lock(queue.mutex);
 
@@ -1791,6 +1842,55 @@ int wmain(int argc, wchar_t* argv[])
 
                 queue.queuedBytes += size;
                 queue.blocks.push_back(std::move(block));
+
+                // 从队头砍掉过旧的块。
+                if (format->nSamplesPerSec > 0 && qpcOffsetValid) {
+                    LARGE_INTEGER nowQpc{};
+                    if (QueryPerformanceCounter(&nowQpc)) {
+                        const double now100ns =
+                            static_cast<double>(nowQpc.QuadPart) *
+                            10000000.0 /
+                            static_cast<double>(qpcFrequency.QuadPart) +
+                            qpcOffset100ns;
+
+                        size_t staleDropped = 0;
+                        while (!queue.blocks.empty() &&
+                               queue.blocks.front().hasTimestamp) {
+                            const PcmBlock& front = queue.blocks.front();
+                            const double end100ns =
+                                static_cast<double>(front.qpcStart) +
+                                static_cast<double>(front.frames) *
+                                    10000000.0 /
+                                    static_cast<double>(
+                                        format->nSamplesPerSec);
+                            const double frontAgeMs =
+                                (now100ns - end100ns) / 10000.0;
+                            if (frontAgeMs <= kDropBacklogMs)
+                                break;
+
+                            staleDropped += front.data.size();
+                            queue.queuedBytes -= front.data.size();
+                            queue.blocks.pop_front();
+                        }
+
+                        if (staleDropped > 0)
+                            staleDroppedMs =
+                                static_cast<double>(staleDropped) /
+                                sendBytesPerMs;
+                    }
+                }
+            }
+
+            if (staleDroppedMs > 0.0) {
+                if (!captureDropActive) {
+                    std::wcout << L"Queue backlog; dropped "
+                               << static_cast<long long>(staleDroppedMs)
+                               << L" ms of stale audio.\n";
+                    captureDropActive = true;
+                }
+            } else if (captureDropActive) {
+                std::wcout << L"Queue is fresh again.\n";
+                captureDropActive = false;
             }
         };
 
@@ -2188,6 +2288,7 @@ int wmain(int argc, wchar_t* argv[])
                             : 0.0;
 
                     // 队列头那块音频有多旧：这是最接近“用户听到的延迟”的数字。
+                    // 用和丢弃判断相同的校准偏移，保证日志和实际行为一致。
                     double headAgeMs = -1.0;
                     {
                         std::lock_guard<std::mutex> lock(queue.mutex);
@@ -2197,8 +2298,10 @@ int wmain(int argc, wchar_t* argv[])
                             if (QueryPerformanceCounter(&nowQpc)) {
                                 const double now100ns =
                                     static_cast<double>(nowQpc.QuadPart) *
-                                    10000000.0 /
-                                    static_cast<double>(qpcFrequency.QuadPart);
+                                        10000000.0 /
+                                        static_cast<double>(
+                                            qpcFrequency.QuadPart) +
+                                    qpcOffset100ns;
                                 const PcmBlock& head = queue.blocks.front();
                                 const double end100ns =
                                     static_cast<double>(head.qpcStart) +
