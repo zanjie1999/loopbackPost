@@ -19,6 +19,7 @@
 #include <deque>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,14 +52,20 @@ static uint64_t g_writeOver1MsCalls = 0;
 static double g_writeMaxMs = 0.0;
 static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 
-// 允许的最大采集音频包年龄；超过后丢弃旧音频追赶实时。
+// 发送队列里允许攒下的最大音频毫秒数；超过就丢弃最旧的一段追赶实时。
 static double kDropBacklogMs = 20.0;
 
 // 拥塞补偿时“丢弃段”的最小粒度。
-// 每个分片丢一半：按kDropUnitMs粒度交替丢,然后发送留下的部分
+// 按kDropUnitMs粒度交替丢/留,留下的是短暂的 2 倍速,听感上比整段跳过好。
 static double kDropUnitMs = 5;
 // 延迟已经非常大时，直接把旧数据全部丢掉，避免用户长时间听到快进/跳跃。
 static double kDropAllBacklogMs = 500.0;
+
+// 发送节拍：采集到的音频先入发送队列，再由发送循环每 kSendChunkMs 写一块。
+// 以前是“来一个 WASAPI 包就写一次”，socket 发送缓冲一满写调用就阻塞，
+// 阻塞期间采集侧继续积压，socket 一空又把积压一次性灌进去，
+// 于是内核发送缓冲里常年堆着 100~300ms 的音频，那才是延迟主体。
+static double kSendChunkMs = 10.0;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -70,6 +77,14 @@ static constexpr auto kServiceRetryDelay = std::chrono::seconds(10);
 // 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
 static constexpr auto kCongestionReconnectDelay = std::chrono::milliseconds(200);
 
+
+// 采集线程与发送线程之间的 PCM 队列（已转换成 s16le）。
+// 采集线程只负责入队，绝不等网络；发送循环按固定节拍取块写出。
+struct PcmQueue {
+    std::mutex mutex;
+    std::deque<std::vector<BYTE>> blocks;
+    size_t queuedBytes = 0;
+};
 
 static void ResetWriteStats()
 {
@@ -1612,12 +1627,10 @@ int wmain(int argc, wchar_t* argv[])
         std::wcout
             << L"Press Enter to reconnect, Ctrl+C to stop.\n";
 
-        std::vector<int16_t> pcm16;
         const bool serviceMode = (argc >= 2);
 
         bool connected = false;
         bool streamConfirmed = false; // 已持续成功写出多块音频数据
-        bool timestampWarningShown = false;
         int successfulChunks = 0;
         int autoReconnectAttempts = 0;
         bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
@@ -1632,88 +1645,322 @@ int wmain(int argc, wchar_t* argv[])
         }
         ok = true;
 
-        // 当前还需要从历史音频中跳过的旧帧总量。
-        uint64_t dropFrames = 0;
-        bool dropBacklogActive = false;
-
-        // 丢弃粒度（1ms）对应的帧数。
+        // 丢弃粒度（kDropUnitMs）对应的帧数。
         const uint64_t dropUnitFrames = std::max<uint64_t>(
             1,
             static_cast<uint64_t>(
                 static_cast<double>(format->nSamplesPerSec) *
                 kDropUnitMs / 1000.0));
 
-        const auto clearCompensation = [&]() {
-            dropFrames = 0;
-            dropBacklogActive = false;
+        // 一次写出的目标字节数（s16le）。
+        const size_t sendBytesPerFrame =
+            static_cast<size_t>(format->nChannels) * sizeof(int16_t);
+        const size_t sendChunkBytes = std::max<size_t>(
+            1,
+            static_cast<size_t>(
+                static_cast<double>(format->nSamplesPerSec) *
+                kSendChunkMs / 1000.0) *
+                sendBytesPerFrame);
+        const double sendBytesPerMs =
+            static_cast<double>(format->nSamplesPerSec) *
+            static_cast<double>(sendBytesPerFrame) / 1000.0;
+
+        // 队列上限：攒到这么多音频就丢最旧的，避免延迟越滚越大。
+        // 留出几个节拍的余量，正常的采集/发送抖动不会触发丢弃。
+        const size_t maxQueuedBytes = std::max<size_t>(
+            sendChunkBytes * 3,
+            static_cast<size_t>(sendBytesPerMs * kDropBacklogMs * 2));
+
+        // 采集与发送之间的队列，以及采集线程。
+        PcmQueue queue;
+        std::thread captureThread;
+        bool captureRunning = false;
+        // captureStop：主线程要求采集线程退出。
+        // captureFault：采集线程自己出错（设备被拔、GetBuffer 失败）。
+        std::atomic_bool captureStop{false};
+        std::atomic_bool captureFault{false};
+        auto sendDeadline = std::chrono::steady_clock::now();
+
+        // 把 PCM 入队。采集线程只做这一步，永远不等网络。
+        const auto enqueuePcm = [&](const std::vector<int16_t>& pcm) {
+            if (pcm.empty())
+                return;
+
+            const BYTE* bytes = reinterpret_cast<const BYTE*>(pcm.data());
+            const size_t size = pcm.size() * sizeof(int16_t);
+
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            while (queue.queuedBytes + size > maxQueuedBytes &&
+                   !queue.blocks.empty()) {
+                queue.queuedBytes -= queue.blocks.front().size();
+                queue.blocks.pop_front();
+            }
+            queue.queuedBytes += size;
+            queue.blocks.emplace_back(bytes, bytes + size);
         };
 
-        // 发送一段 PCM：转换 + 写入 + 计数。返回是否成功。
-        const auto sendPcmSegment = [&](const BYTE* segmentData,
-                                        UINT32 segmentFrames,
-                                        DWORD flags) -> bool {
-            const size_t sampleCount =
-                static_cast<size_t>(segmentFrames) * format->nChannels;
-            const DWORD outputBytes =
-                static_cast<DWORD>(sampleCount * sizeof(int16_t));
+        const auto clearSendQueue = [&]() {
+            std::lock_guard<std::mutex> lock(queue.mutex);
+            queue.blocks.clear();
+            queue.queuedBytes = 0;
+            sendDeadline = std::chrono::steady_clock::now();
+        };
 
-            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                static BYTE zeroBuffer[64 * 1024]{};
-                DWORD left = outputBytes;
+        // 从队头取一块。取不满也照发，避免为了凑满增加延迟。
+        const auto takeSendBlock = [&]() {
+            std::vector<BYTE> block;
+            std::lock_guard<std::mutex> lock(queue.mutex);
 
-                while (left > 0 && !g_stop.load()) {
-                    DWORD chunk =
-                        (left < static_cast<DWORD>(sizeof(zeroBuffer)))
-                            ? left
-                            : static_cast<DWORD>(sizeof(zeroBuffer));
+            size_t taken = 0;
+            while (taken < sendChunkBytes && !queue.blocks.empty()) {
+                std::vector<BYTE>& front = queue.blocks.front();
+                const size_t need = sendChunkBytes - taken;
+                if (front.size() <= need) {
+                    block.insert(block.end(), front.begin(), front.end());
+                    taken += front.size();
+                    queue.queuedBytes -= front.size();
+                    queue.blocks.pop_front();
+                } else {
+                    block.insert(block.end(), front.begin(),
+                                 front.begin() + need);
+                    front.erase(front.begin(), front.begin() + need);
+                    taken += need;
+                    queue.queuedBytes -= need;
+                }
+            }
+            return block;
+        };
 
-                    if (!WritePcm(request, zeroBuffer, chunk))
-                        return false;
+        // 采集线程：只把 WASAPI 数据搬进队列，绝不等网络。
+        // 以前采集和发送挤在同一个循环里，socket 发送缓冲一满，
+        // WinHttpWriteData 就阻塞，阻塞期间 loopback 缓冲继续积压，
+        // 写通了再把积压一次性灌进内核发送缓冲——那才是 100~300ms 延迟的主体。
+        const auto startCaptureThread = [&]() {
+            captureStop.store(false);
+            captureFault.store(false);
 
-                    ++successfulChunks;
-                    if (!streamConfirmed && successfulChunks >= 3) {
-                        streamConfirmed = true;
-                        hasStreamedSuccessfully = true;
-                        autoReconnectAttempts = 0;
-                        serviceRetryDelay = false;
-                        retryAfterDelay = false;
-                        std::wcout << L"Connected. Audio data flowing.\n";
+            // 显式捕获需要的东西，不依赖外层 lambda 的栈帧：
+            // startCaptureThread 返回后，这里的引用仍必须有效。
+            std::thread worker([&queue, &captureStop, &captureFault,
+                                &format, &sampleType, &captureClient,
+                                &audioCaptureEvent, &qpcFrequency,
+                                &dropUnitFrames, &sendBytesPerMs,
+                                &enqueuePcm]() {
+                std::vector<int16_t> capturePcm;
+                bool captureDropActive = false;
+                bool captureTimestampWarned = false;
+
+                while (!g_stop.load() && !captureStop.load()) {
+                    const DWORD audioWait =
+                        WaitForSingleObject(audioCaptureEvent, 5);
+                    if (audioWait == WAIT_FAILED) {
+                        PrintWinError(
+                            L"WaitForSingleObject(audio capture event)");
+                        captureFault.store(true);
+                        break;
+                    }
+                    // WAIT_TIMEOUT 只是轮询兜底，继续下一轮。
+                    if (audioWait != WAIT_OBJECT_0)
+                        continue;
+
+                    UINT32 packetFrames = 0;
+                    const HRESULT packetHr =
+                        captureClient->GetNextPacketSize(&packetFrames);
+                    if (FAILED(packetHr)) {
+                        PrintHr(L"IAudioCaptureClient::GetNextPacketSize",
+                                packetHr);
+                        captureFault.store(true);
+                        break;
                     }
 
-                    left -= chunk;
+                    while (packetFrames > 0 &&
+                           !g_stop.load() && !captureStop.load()) {
+                        BYTE* data = nullptr;
+                        UINT32 frames = 0;
+                        DWORD flags = 0;
+                        UINT64 qpcPosition = 0;
+
+                        const HRESULT bufferHr = captureClient->GetBuffer(
+                            &data, &frames, &flags, nullptr, &qpcPosition);
+                        if (FAILED(bufferHr)) {
+                            PrintHr(L"IAudioCaptureClient::GetBuffer",
+                                    bufferHr);
+                            captureFault.store(true);
+                            break;
+                        }
+
+                        // 这一包音频在 WASAPI 里等了多久，衡量采集侧积压。
+                        bool timestampAvailable =
+                            (flags &
+                             AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 &&
+                            qpcPosition != 0;
+                        double packetAgeMs = 0.0;
+                        if (timestampAvailable) {
+                            LARGE_INTEGER currentQpc{};
+                            if (QueryPerformanceCounter(&currentQpc)) {
+                                const double currentQpc100ns =
+                                    static_cast<double>(currentQpc.QuadPart) *
+                                    10000000.0 /
+                                    static_cast<double>(
+                                        qpcFrequency.QuadPart);
+                                packetAgeMs = std::max(
+                                    0.0,
+                                    (currentQpc100ns -
+                                     static_cast<double>(qpcPosition)) /
+                                        10000.0);
+                            }
+                        } else if (!captureTimestampWarned) {
+                            std::wcerr
+                                << L"WASAPI packet timestamp unavailable; using write-time fallback for this capture session.\n";
+                            captureTimestampWarned = true;
+                        }
+
+                        size_t queuedBytes = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(queue.mutex);
+                            queuedBytes = queue.queuedBytes;
+                        }
+                        const double queuedMs =
+                            static_cast<double>(queuedBytes) /
+                            sendBytesPerMs;
+                        // 队列里本来就有一块待发（节拍固有延迟），
+                        // 这段不算积压，否则正常播放也会被判成拥塞。
+                        const double backlogMs =
+                            std::max(0.0, queuedMs - kSendChunkMs);
+                        const double latencyMs = packetAgeMs + backlogMs;
+
+                        // 超过 kDropBacklogMs 就丢最旧的音频追赶实时。
+                        uint64_t dropThisPacket = 0;
+                        if (latencyMs > kDropBacklogMs) {
+                            const double excessMs =
+                                latencyMs - kDropBacklogMs;
+                            dropThisPacket =
+                                static_cast<uint64_t>(std::ceil(
+                                    excessMs * format->nSamplesPerSec /
+                                    1000.0));
+                            // 延迟已经大到 kDropAllBacklogMs 时不再做 2 倍速，
+                            // 直接整段丢掉：否则用户要听很久的快进才追上实时。
+                            if (latencyMs < kDropAllBacklogMs) {
+                                // 单包最多丢一半，剩下按 kDropUnitMs 粒度交替
+                                // 丢/留，听感上是短暂 2 倍速，比整段跳过自然。
+                                dropThisPacket = std::min<uint64_t>(
+                                    dropThisPacket,
+                                    static_cast<uint64_t>(frames) / 2);
+                            }
+                            if (!captureDropActive) {
+                                std::wcout
+                                    << L"Audio latency "
+                                    << static_cast<long long>(latencyMs)
+                                    << L" ms (capture "
+                                    << static_cast<long long>(packetAgeMs)
+                                    << L" ms, queued "
+                                    << static_cast<long long>(queuedMs)
+                                    << L" ms); dropping stale audio.\n";
+                                captureDropActive = true;
+                            }
+                        } else if (captureDropActive) {
+                            std::wcout << L"Drop backlog cleared.\n";
+                            captureDropActive = false;
+                        }
+
+                        if (frames > 0 && data != nullptr) {
+                            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                                // 静音包：内存内容未定义，按零处理。
+                                capturePcm.assign(
+                                    static_cast<size_t>(frames) *
+                                        format->nChannels,
+                                    0);
+                            } else if (!ConvertToS16(data, frames, format,
+                                                     sampleType,
+                                                     capturePcm)) {
+                                std::wcerr << L"PCM conversion failed.\n";
+                                captureClient->ReleaseBuffer(frames);
+                                captureFault.store(true);
+                                break;
+                            }
+
+                            if (dropThisPacket > 0) {
+                                // 按 kDropUnitMs 粒度交替丢/留，
+                                // 留下的是压缩后的音频。
+                                std::vector<int16_t> kept;
+                                kept.reserve(capturePcm.size());
+                                uint64_t dropped = 0;
+                                bool dropNext = true;
+                                UINT32 frameOffset = 0;
+
+                                while (frameOffset < frames) {
+                                    const UINT32 take = static_cast<UINT32>(
+                                        std::min<uint64_t>(
+                                            dropUnitFrames,
+                                            static_cast<uint64_t>(frames) -
+                                                frameOffset));
+                                    const UINT32 dropCount =
+                                        (dropNext &&
+                                         dropped < dropThisPacket)
+                                            ? static_cast<UINT32>(
+                                                  std::min<uint64_t>(
+                                                      take,
+                                                      dropThisPacket -
+                                                          dropped))
+                                            : 0;
+                                    dropped += dropCount;
+
+                                    if (take > dropCount) {
+                                        const int16_t* src =
+                                            capturePcm.data() +
+                                            static_cast<size_t>(
+                                                frameOffset + dropCount) *
+                                                format->nChannels;
+                                        kept.insert(
+                                            kept.end(), src,
+                                            src +
+                                                static_cast<size_t>(
+                                                    take - dropCount) *
+                                                    format->nChannels);
+                                    }
+
+                                    frameOffset += take;
+                                    dropNext = !dropNext;
+                                }
+
+                                enqueuePcm(kept);
+                            } else {
+                                enqueuePcm(capturePcm);
+                            }
+                        }
+
+                        captureClient->ReleaseBuffer(frames);
+
+                        const HRESULT nextHr =
+                            captureClient->GetNextPacketSize(&packetFrames);
+                        if (FAILED(nextHr)) {
+                            PrintHr(
+                                L"IAudioCaptureClient::GetNextPacketSize",
+                                nextHr);
+                            captureFault.store(true);
+                            break;
+                        }
+                    }
                 }
-                return true;
+            });
+            // 正常流程里 startCaptureThread 只在 !captureRunning 时调用，
+            // 而 stopCaptureThread 一定会 join；这里再防一次，避免误用。
+            if (captureThread.joinable())
+                captureThread.join();
+            captureThread = std::move(worker);
+            captureRunning = true;
+        };
+
+        const auto stopCaptureThread = [&]() {
+            captureStop.store(true);
+            if (captureRunning) {
+                if (captureThread.joinable())
+                    captureThread.join();
+                captureRunning = false;
             }
-
-            if (segmentData == nullptr || segmentFrames == 0)
-                return true;
-
-            if (!ConvertToS16(
-                    segmentData,
-                    segmentFrames,
-                    format,
-                    sampleType,
-                    pcm16)) {
-                std::wcerr << L"PCM conversion failed.\n";
-                return false;
-            }
-
-            if (!WritePcm(
-                    request,
-                    reinterpret_cast<const BYTE*>(pcm16.data()),
-                    outputBytes))
-                return false;
-
-            ++successfulChunks;
-            if (!streamConfirmed && successfulChunks >= 3) {
-                streamConfirmed = true;
-                hasStreamedSuccessfully = true;
-                autoReconnectAttempts = 0;
-                serviceRetryDelay = false;
-                retryAfterDelay = false;
-                std::wcout << L"Connected. Audio data flowing.\n";
-            }
-            return true;
+            captureStop.store(false);
+            captureFault.store(false);
+            clearSendQueue();
         };
 
         while (!g_stop.load()) {
@@ -1807,11 +2054,11 @@ int wmain(int argc, wchar_t* argv[])
                 }
 
                 ResetWriteStats();
-                                streamConfirmed = false;
-                                successfulChunks = 0;
-                                clearCompensation();
-                                std::wcout
-                                    << L"HTTP connected; waiting for audio writes...\n";
+                streamConfirmed = false;
+                successfulChunks = 0;
+                clearSendQueue();
+                std::wcout
+                    << L"HTTP connected; waiting for audio writes...\n";
             }
 
             const bool reconnectRequested =
@@ -1847,314 +2094,95 @@ int wmain(int argc, wchar_t* argv[])
                     retryAfterDelay = false;
                     serviceRetryDelay = false;
                     shortReconnectDelay = true;
-                    clearCompensation();
 
-                    // Stop+Reset 丢弃当前捕获积压，并给服务端时间释放旧连接。
+                    // 先停采集线程，再 Stop+Reset 丢弃捕获积压，
+                    // 并给服务端时间释放旧连接。
+                    stopCaptureThread();
+
                     if (!stopAndFlushAudioCapture()) {
                         std::wcerr
                             << L"Failed to flush audio capture; will rebuild it during reconnect.\n";
                     }
 
-                    clearCompensation();
                     ResetWriteStats();
                     continue;
                 }
             }
 
-            // The event wakes immediately when loopback data is ready. A short
-            // timeout keeps console controls responsive and polls as a fallback
-            // on older Windows builds whose loopback events are not delivered.
-            const DWORD audioWait = WaitForSingleObject(audioCaptureEvent, 5);
-            if (audioWait == WAIT_FAILED) {
-                PrintWinError(L"WaitForSingleObject(audio capture event)");
-                connected = false;
-                break;
-            }
+            // 采集在独立线程里跑，主循环只按固定节拍从队列取块写出。
+            // 这样 socket 发送缓冲满的时候，阻塞的只有发送这一侧，
+            // 采集侧不会跟着积压，queued audio age 也就不会滚到几百毫秒。
+            if (connected && !captureRunning)
+                startCaptureThread();
 
-            UINT32 packetFrames = 0;
+            // 发送：按固定节拍，每 kSendChunkMs 从队列头取一块写出。
+            // 落后时只重新对齐节拍，绝不补发突发——补发正是把音频
+            // 堆进内核发送缓冲、让延迟滚大的元凶。
+            if (connected) {
+                const auto beforeWait = std::chrono::steady_clock::now();
+                if (sendDeadline > beforeWait)
+                    std::this_thread::sleep_until(sendDeadline);
 
-            hr = captureClient->GetNextPacketSize(
-                &packetFrames);
+                std::vector<BYTE> block = takeSendBlock();
 
-            if (FAILED(hr)) {
-                PrintHr(
-                    L"IAudioCaptureClient::GetNextPacketSize",
-                    hr);
-                connected = false;
-                break;
-            }
-
-            if (packetFrames == 0) {
-                continue;
-            }
-
-            while (
-                packetFrames > 0 &&
-                !g_stop.load()) {
-
-                BYTE* data = nullptr;
-                UINT32 frames = 0;
-                DWORD flags = 0;
-                UINT64 qpcPosition = 0;
-
-                hr = captureClient->GetBuffer(
-                    &data,
-                    &frames,
-                    &flags,
-                    nullptr,
-                    &qpcPosition);
-
-                if (FAILED(hr)) {
-                    PrintHr(
-                        L"IAudioCaptureClient::GetBuffer",
-                        hr);
-                    connected = false;
-                    break;
-                }
-
-                bool timestampAvailable =
-                    (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 &&
-                    qpcPosition != 0;
-                double packetAgeMs = 0.0;
-                if (timestampAvailable) {
-                    LARGE_INTEGER currentQpc{};
-                    if (!QueryPerformanceCounter(&currentQpc)) {
-                        PrintWinError(L"QueryPerformanceCounter");
-                        captureClient->ReleaseBuffer(frames);
+                if (!block.empty()) {
+                    if (!WritePcm(request, block.data(),
+                                  static_cast<DWORD>(block.size()))) {
                         connected = false;
-                        break;
-                    }
-
-                    const double currentQpc100ns =
-                        static_cast<double>(currentQpc.QuadPart) *
-                        10000000.0 /
-                        static_cast<double>(qpcFrequency.QuadPart);
-                    packetAgeMs = std::max(
-                        0.0,
-                        (currentQpc100ns -
-                         static_cast<double>(qpcPosition)) /
-                            10000.0);
-                    const double excessAgeMs =
-                        packetAgeMs - kDropBacklogMs;
-                    dropFrames =
-                        excessAgeMs > 0.0
-                            ? static_cast<uint64_t>(std::ceil(
-                                  excessAgeMs *
-                                  format->nSamplesPerSec / 1000.0))
-                            : 0;
-                    if (dropFrames > 0) {
-                        if (!dropBacklogActive) {
+                    } else {
+                        ++successfulChunks;
+                        if (!streamConfirmed && successfulChunks >= 3) {
+                            streamConfirmed = true;
+                            hasStreamedSuccessfully = true;
+                            autoReconnectAttempts = 0;
+                            serviceRetryDelay = false;
+                            retryAfterDelay = false;
                             std::wcout
-                                << L"Audio packet age "
-                                << static_cast<long long>(packetAgeMs)
-                                << L" ms; dropping stale audio.\n";
-                        }
-                        dropBacklogActive = true;
-                    }
-                } else if (!timestampWarningShown) {
-                    std::wcerr
-                        << L"WASAPI packet timestamp unavailable; using write-time fallback for this capture session.\n";
-                    timestampWarningShown = true;
-                    dropFrames = 0;
-                    dropBacklogActive = false;
-                }
-
-                // 每个分片进来时，如果还有欠账，按 kDropUnitMs 粒度交替“丢/留”，
-                // 留的段累积到分片剩余大小后一次性发送；否则正常发送整个分片。
-                UINT32 frameOffset = 0;
-                bool packetHandled = false;
-
-                if (dropFrames > 0) {
-                    // 欠账太大时，直接丢弃旧帧，快速追上实时音频。
-                    const double backlogMs =
-                        static_cast<double>(dropFrames) * 1000.0 /
-                        static_cast<double>(format->nSamplesPerSec);
-                    if ((timestampAvailable &&
-                         packetAgeMs >= kDropAllBacklogMs) ||
-                        (!timestampAvailable &&
-                         backlogMs >= kDropAllBacklogMs)) {
-                        const uint64_t dropCount = std::min<uint64_t>(
-                            dropFrames,
-                            static_cast<uint64_t>(frames));
-                        dropFrames -= dropCount;
-                        packetHandled = true;
-
-                        const UINT32 remainingFrames =
-                            frames - static_cast<UINT32>(dropCount);
-                        if (remainingFrames > 0 &&
-                            !sendPcmSegment(
-                                data != nullptr
-                                    ? data + static_cast<size_t>(dropCount) *
-                                                 format->nBlockAlign
-                                    : nullptr,
-                                remainingFrames,
-                                flags)) {
-                            connected = false;
+                                << L"Connected. Audio data flowing.\n";
                         }
                     }
-
-                    if (!packetHandled) {
-                        // 本分片丢弃量 = min(分片一半, 剩余欠账)。
-                        const uint64_t dropThisPacket = std::min<uint64_t>(
-                            static_cast<uint64_t>(frames) / 2,
-                            dropFrames);
-
-                        // 按 kDropUnitMs 粒度交替丢/留，留的段累积到 sendAccum。
-                        std::vector<BYTE> sendAccum;
-                        sendAccum.reserve(
-                            static_cast<size_t>(frames) * format->nBlockAlign);
-                        uint64_t sendAccumFrames = 0;
-                        uint64_t dropped = 0;
-                        bool dropNext = true;
-
-                        while (frameOffset < frames && connected && !g_stop.load()) {
-                            const UINT32 take = static_cast<UINT32>(
-                                std::min<uint64_t>(
-                                    dropUnitFrames,
-                                    static_cast<uint64_t>(frames) - frameOffset));
-
-                            if (dropNext && dropped < dropThisPacket) {
-                                const UINT32 dropCount = static_cast<UINT32>(
-                                    std::min<uint64_t>(
-                                        take,
-                                        dropThisPacket - dropped));
-                                dropped += dropCount;
-
-                                const UINT32 sendCount = take - dropCount;
-                                if (sendCount > 0 && data != nullptr) {
-                                    const UINT32 sendOffset = frameOffset + dropCount;
-                                    sendAccum.insert(
-                                        sendAccum.end(),
-                                        data + static_cast<size_t>(sendOffset) * format->nBlockAlign,
-                                        data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
-                                }
-                                sendAccumFrames += sendCount;
-                            } else {
-                                // 留这段：累积到 sendAccum。
-                                if (data != nullptr) {
-                                    sendAccum.insert(
-                                        sendAccum.end(),
-                                        data + static_cast<size_t>(frameOffset) * format->nBlockAlign,
-                                        data + static_cast<size_t>(frameOffset + take) * format->nBlockAlign);
-                                }
-                                sendAccumFrames += take;
-                            }
-
-                            frameOffset += take;
-                            dropNext = !dropNext;
-                        }
-
-                        dropFrames -= dropped;
-
-                        // 发送累积的留段。
-                        if (connected && sendAccumFrames > 0) {
-                            if (!sendPcmSegment(
-                                    sendAccum.data(),
-                                    static_cast<UINT32>(sendAccumFrames),
-                                    flags)) {
-                                connected = false;
-                            }
-                        }
-                    }
-                } else {
-                    // 无欠账，正常发送整个分片。
-                    if (!sendPcmSegment(data, frames, flags))
-                        connected = false;
                 }
 
-                if (dropFrames == 0 && dropBacklogActive) {
-                    std::wcout << L"Drop backlog cleared.\n";
-                    dropBacklogActive = false;
-                }
-
-                captureClient->ReleaseBuffer(frames);
-
-                if (!connected || g_stop.load())
-                    break;
-
-                // 连续 PCM body 的写入累计达到阈值时，不断开连接。
-                // 把 WriteData 耗时转换成历史音频欠账
+                // 拥塞日志：写调用阻塞了多少、队列里还压着多少。
                 if (g_blockedMs >= kDropBacklogMs) {
                     const double dropMs = g_blockedMs;
-
-                    if (!timestampAvailable) {
-                        const uint64_t newDropFrames =
-                            static_cast<uint64_t>(
-                                static_cast<double>(format->nSamplesPerSec) *
-                                dropMs / 1000.0);
-
-                        dropFrames += newDropFrames;
-                        dropBacklogActive = true;
+                    size_t queuedNow = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(queue.mutex);
+                        queuedNow = queue.queuedBytes;
                     }
-
-                    const double backlogMs =
-                        static_cast<double>(dropFrames) * 1000.0 /
-                        static_cast<double>(format->nSamplesPerSec);
-                    double captureQueueAgeMs = packetAgeMs;
-                    if (timestampAvailable) {
-                        LARGE_INTEGER currentQpc{};
-                        if (QueryPerformanceCounter(&currentQpc)) {
-                            const double currentQpc100ns =
-                                static_cast<double>(currentQpc.QuadPart) *
-                                10000000.0 /
-                                static_cast<double>(qpcFrequency.QuadPart);
-                            const double packetEndQpc100ns =
-                                static_cast<double>(qpcPosition) +
-                                static_cast<double>(frames) * 10000000.0 /
-                                    format->nSamplesPerSec;
-                            captureQueueAgeMs = std::max(
-                                0.0,
-                                (currentQpc100ns - packetEndQpc100ns) /
-                                    10000.0);
-                        } else {
-                            PrintWinError(L"QueryPerformanceCounter");
-                        }
-                    }
-                    const double averageWriteMs =
-                        g_writeCalls > 0
-                            ? dropMs / static_cast<double>(g_writeCalls)
-                            : 0.0;
-
                     std::wcout
                         << L"Network congested (writes blocked "
                         << static_cast<long long>(dropMs)
-                        << L" ms); ";
-                    if (timestampAvailable) {
-                        std::wcout
-                            << L"queued audio age "
-                            << static_cast<long long>(captureQueueAgeMs)
-                            << L" ms; ";
-                    } else {
-                        std::wcout
-                            << L"estimated queued "
-                            << static_cast<long long>(backlogMs)
-                            << L" ms; ";
-                    }
-                    std::wcout
-                        << L"WriteData calls="
-                        << g_writeCalls
+                        << L" ms); queued audio "
+                        << static_cast<long long>(
+                               static_cast<double>(queuedNow) /
+                               sendBytesPerMs)
+                        << L" ms; WriteData calls=" << g_writeCalls
                         << L", avg="
-                        << averageWriteMs
-                        << L" ms, max="
-                        << g_writeMaxMs
-                        << L" ms, >=1ms="
-                        << g_writeOver1MsCalls
+                        << (g_writeCalls > 0
+                                ? dropMs / static_cast<double>(g_writeCalls)
+                                : 0.0)
+                        << L" ms, max=" << g_writeMaxMs
+                        << L" ms, >=1ms=" << g_writeOver1MsCalls
                         << L"\n";
-
                     ResetWriteStats();
                 }
 
-                hr = captureClient->GetNextPacketSize(
-                    &packetFrames);
-
-                if (FAILED(hr)) {
-                    PrintHr(
-                        L"IAudioCaptureClient::GetNextPacketSize",
-                        hr);
-                    connected = false;
-                    break;
+                // 推进节拍。写阻塞过久就重新对齐，绝不补发错过的节拍。
+                sendDeadline += std::chrono::microseconds(
+                    static_cast<long long>(kSendChunkMs * 1000.0));
+                const auto after = std::chrono::steady_clock::now();
+                if (sendDeadline < after) {
+                    sendDeadline = after + std::chrono::microseconds(
+                        static_cast<long long>(kSendChunkMs * 1000.0));
                 }
             }
+
+            // 采集侧出错（设备被拔、GetBuffer 失败）：按断线处理。
+            if (connected && captureFault.load())
+                connected = false;
+
 
             if (!connected && !g_stop.load()) {
                 DWORD httpStatus = 0;
@@ -2210,10 +2238,9 @@ int wmain(int argc, wchar_t* argv[])
                 }
 
                 closeHttp();
+                stopCaptureThread();
                 stopAndFlushAudioCapture();
-                dropFrames = 0;
-                dropBacklogActive = false;
-                                streamConfirmed = false;
+                streamConfirmed = false;
 
                 ++autoReconnectAttempts;
 
@@ -2257,6 +2284,7 @@ int wmain(int argc, wchar_t* argv[])
             }
         }
 
+        stopCaptureThread();
         audioClient->Stop();
 
         // 连续 PCM body 使用长 Content-Length，不发送 chunk 结束标记。
