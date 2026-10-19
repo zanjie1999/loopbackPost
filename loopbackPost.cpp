@@ -52,13 +52,12 @@ static uint64_t g_writeOver1MsCalls = 0;
 static double g_writeMaxMs = 0.0;
 static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 
-// 发送队列里允许攒下的最大音频毫秒数；超过就丢弃最旧的一段追赶实时。
+// 允许的最大音频年龄（毫秒）。用 WASAPI 时间戳算出的“这段音频现在有多旧”，
+// 超过就从这段音频开头丢弃，只发最新的部分，保证下位机收到的一定是新的。
+// 延迟补偿由下位机负责，上游只负责“别发旧的”。
 static double kDropBacklogMs = 20.0;
 
-// 拥塞补偿时“丢弃段”的最小粒度。
-// 按kDropUnitMs粒度交替丢/留,留下的是短暂的 2 倍速,听感上比整段跳过好。
-static double kDropUnitMs = 5;
-// 延迟已经非常大时，直接把旧数据全部丢掉，避免用户长时间听到快进/跳跃。
+// 队列硬上限（毫秒音频），只用来兜住服务端彻底卡死的病态情况。
 static double kDropAllBacklogMs = 500.0;
 
 // 发送节拍：采集到的音频先入发送队列，再由发送循环每 kSendChunkMs 写一块。
@@ -78,11 +77,23 @@ static constexpr auto kServiceRetryDelay = std::chrono::seconds(10);
 static constexpr auto kCongestionReconnectDelay = std::chrono::milliseconds(200);
 
 
-// 采集线程与发送线程之间的 PCM 队列（已转换成 s16le）。
-// 采集线程只负责入队，绝不等网络；发送循环按固定节拍取块写出。
+// 队列里的一段 PCM（已转换成 s16le），带它在系统时钟上的位置。
+//
+// 时间戳是关键：它来自 WASAPI 的 qpcPosition，表示这段音频在系统时钟上
+// 的起点。用它可以直接算出这段音频“现在有多旧”，从而只发新鲜的音频，
+// 而不必靠字节数水位去猜——那个猜法看不到已经发出去、堵在链路里的数据。
+struct PcmBlock {
+    std::vector<BYTE> data;
+    UINT64 qpcStart = 0;   // 这段音频起点（QPC 100ns）
+    UINT32 frames = 0;     // 这段音频包含多少帧
+    bool hasTimestamp = false;
+};
+
+// 采集线程与发送线程之间的 PCM 队列。
+// 采集线程只负责入队，绝不等网络；发送循环只管尽快写出。
 struct PcmQueue {
     std::mutex mutex;
-    std::deque<std::vector<BYTE>> blocks;
+    std::deque<PcmBlock> blocks;
     size_t queuedBytes = 0;
 };
 
@@ -1174,13 +1185,8 @@ int wmain(int argc, wchar_t* argv[])
     }
 
     if (argc >= 4) {
-        // 第3个参数是丢一半时每次丢掉的ms的大小和间隔
-        kDropUnitMs = std::wcstod(argv[3], nullptr);
-    }
-    
-    if (argc >= 5) {
-        // 第4个参数是达到多少ms丢全部
-        kDropAllBacklogMs = std::wcstod(argv[4], nullptr);
+        // 第3个参数是达到多少ms丢全部
+        kDropAllBacklogMs = std::wcstod(argv[3], nullptr);
     }
 
     if (url.empty()) {
@@ -1645,13 +1651,6 @@ int wmain(int argc, wchar_t* argv[])
         }
         ok = true;
 
-        // 丢弃粒度（kDropUnitMs）对应的帧数。
-        const uint64_t dropUnitFrames = std::max<uint64_t>(
-            1,
-            static_cast<uint64_t>(
-                static_cast<double>(format->nSamplesPerSec) *
-                kDropUnitMs / 1000.0));
-
         // 一次最多写出多少字节（s16le）。
         //
         // 发送不再按固定节拍，而是“有数据就发”，由采集线程的数据到达驱动。
@@ -1671,15 +1670,10 @@ int wmain(int argc, wchar_t* argv[])
             static_cast<double>(sendBytesPerFrame) / 1000.0;
 
         // 队列硬上限：只用来兜住病态情况（比如服务端卡死），不参与日常调节。
+        // 日常的延迟控制由 enqueuePcm 按 WASAPI 时间戳负责。
         const size_t maxQueuedBytes = std::max<size_t>(
             sendChunkBytes * 8,
             static_cast<size_t>(sendBytesPerMs * kDropAllBacklogMs));
-
-        // 队列目标水位：积压超过这个量就从队头丢，追回实时。
-        // 因为不再有节拍，队列里正常只有采集侧最近几毫秒的数据，
-        // 所以这里直接用 kDropBacklogMs 作为目标。
-        const size_t targetQueuedBytes = static_cast<size_t>(
-            sendBytesPerMs * kDropBacklogMs);
 
         // 最小写出量：攒够这么多再写一次，避免 WASAPI 包很小时写调用过碎。
         // 取 5ms，比常见的 WASAPI 包周期（10ms）小，不会引入额外延迟。
@@ -1695,45 +1689,108 @@ int wmain(int argc, wchar_t* argv[])
         std::atomic_bool captureStop{false};
         std::atomic_bool captureFault{false};
 
+        // 只在采集线程里用，记录当前是否处于“丢旧音频追赶”状态，
+        // 避免每包都重复打印。
+        bool captureDropActive = false;
+
         // 发送侧诊断：每 5 秒打一次队列深度和实际发送速率。
         auto lastDiagTime = std::chrono::steady_clock::now();
         size_t diagSentBytes = 0;
 
         // 把 PCM 入队。采集线程只做这一步，永远不等网络。
         //
-        // 队列达到硬上限时必须丢最旧的音频，否则延迟会无限增长。
-        // 这里是“兜底”路径，正常情况下不该触发；一旦触发说明发送
-        // 长期慢于实时，所以必须打日志，不能静默丢弃。
-        const auto enqueuePcm = [&](const std::vector<int16_t>& pcm) {
+        // 关键：用 WASAPI 时间戳判断这段音频“现在有多旧”，太旧就丢掉开头，
+        // 只留最新的部分。这样无论积压来自 WASAPI 缓冲、本进程队列，
+        // 还是已经堵在链路里的数据，都被同一把绝对时间的尺子量到，
+        // 保证发出去的音频一定是新鲜的。
+        const auto enqueuePcm = [&](const std::vector<int16_t>& pcm,
+                                    UINT64 qpcStart,
+                                    UINT32 frames,
+                                    bool hasTimestamp) {
             if (pcm.empty())
                 return;
 
             const BYTE* bytes = reinterpret_cast<const BYTE*>(pcm.data());
-            const size_t size = pcm.size() * sizeof(int16_t);
+            size_t size = pcm.size() * sizeof(int16_t);
+            UINT32 keepFrames = frames;
+            UINT64 keepQpcStart = qpcStart;
 
-            size_t droppedBytes = 0;
-            {
-                std::lock_guard<std::mutex> lock(queue.mutex);
-                while (queue.queuedBytes + size > maxQueuedBytes &&
-                       !queue.blocks.empty()) {
-                    droppedBytes += queue.blocks.front().size();
-                    queue.queuedBytes -= queue.blocks.front().size();
-                    queue.blocks.pop_front();
+            if (hasTimestamp && format->nSamplesPerSec > 0) {
+                LARGE_INTEGER nowQpc{};
+                if (QueryPerformanceCounter(&nowQpc)) {
+                    const double now100ns =
+                        static_cast<double>(nowQpc.QuadPart) * 10000000.0 /
+                        static_cast<double>(qpcFrequency.QuadPart);
+
+                    // 这段音频的结束时刻，以及它已经等了多久。
+                    const double end100ns =
+                        static_cast<double>(qpcStart) +
+                        static_cast<double>(frames) * 10000000.0 /
+                            static_cast<double>(format->nSamplesPerSec);
+                    const double ageMs = (now100ns - end100ns) / 10000.0;
+
+                    if (ageMs > kDropBacklogMs) {
+                        // 超出阈值多少毫秒，就从这段音频开头丢掉多少。
+                        const double excessMs = ageMs - kDropBacklogMs;
+                        uint64_t dropFrames = static_cast<uint64_t>(
+                            std::ceil(excessMs * format->nSamplesPerSec /
+                                      1000.0));
+
+                        if (dropFrames >= frames) {
+                            // 整段都太旧，直接扔掉。
+                            std::wcout
+                                << L"Stale packet (" 
+                                << static_cast<long long>(ageMs)
+                                << L" ms old); dropped entirely.\n";
+                            return;
+                        }
+
+                        const size_t dropBytes =
+                            static_cast<size_t>(dropFrames) *
+                            static_cast<size_t>(format->nChannels) *
+                            sizeof(int16_t);
+                        bytes += dropBytes;
+                        size -= dropBytes;
+                        keepFrames = frames - static_cast<UINT32>(dropFrames);
+                        keepQpcStart =
+                            qpcStart +
+                            static_cast<UINT64>(
+                                static_cast<double>(dropFrames) * 10000000.0 /
+                                static_cast<double>(format->nSamplesPerSec));
+
+                        if (!captureDropActive) {
+                            std::wcout << L"Audio " 
+                                       << static_cast<long long>(ageMs)
+                                       << L" ms old; dropped "
+                                       << static_cast<long long>(excessMs)
+                                       << L" ms to catch up.\n";
+                            captureDropActive = true;
+                        }
+                    } else if (captureDropActive) {
+                        std::wcout << L"Audio age back to normal.\n";
+                        captureDropActive = false;
+                    }
                 }
-                queue.queuedBytes += size;
-                queue.blocks.emplace_back(bytes, bytes + size);
             }
 
-            if (droppedBytes > 0) {
-                std::wcout << L"Send queue hit hard limit ("
-                           << static_cast<long long>(
-                                  static_cast<double>(maxQueuedBytes) /
-                                  sendBytesPerMs)
-                           << L" ms); dropped "
-                           << static_cast<long long>(
-                                  static_cast<double>(droppedBytes) /
-                                  sendBytesPerMs)
-                           << L" ms. Sender is slower than realtime.\n";
+            {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+
+                // 硬上限兜底：防止服务端彻底卡死时内存无限增长。
+                while (queue.queuedBytes + size > maxQueuedBytes &&
+                       !queue.blocks.empty()) {
+                    queue.queuedBytes -= queue.blocks.front().data.size();
+                    queue.blocks.pop_front();
+                }
+
+                PcmBlock block;
+                block.data.assign(bytes, bytes + size);
+                block.qpcStart = keepQpcStart;
+                block.frames = keepFrames;
+                block.hasTimestamp = hasTimestamp;
+
+                queue.queuedBytes += size;
+                queue.blocks.push_back(std::move(block));
             }
         };
 
@@ -1749,68 +1806,27 @@ int wmain(int argc, wchar_t* argv[])
             std::vector<BYTE> block;
             std::lock_guard<std::mutex> lock(queue.mutex);
 
-            // 有数据就全取走（最多 sendChunkBytes），
-            // 这样写出的块大小就等于采集侧刚到的量，不需要节拍去凑。
             size_t taken = 0;
             while (taken < sendChunkBytes && !queue.blocks.empty()) {
-                std::vector<BYTE>& front = queue.blocks.front();
+                PcmBlock& front = queue.blocks.front();
                 const size_t need = sendChunkBytes - taken;
-                if (front.size() <= need) {
-                    block.insert(block.end(), front.begin(), front.end());
-                    taken += front.size();
-                    queue.queuedBytes -= front.size();
+                if (front.data.size() <= need) {
+                    block.insert(block.end(), front.data.begin(),
+                                 front.data.end());
+                    taken += front.data.size();
+                    queue.queuedBytes -= front.data.size();
                     queue.blocks.pop_front();
                 } else {
-                    block.insert(block.end(), front.begin(),
-                                 front.begin() + need);
-                    front.erase(front.begin(), front.begin() + need);
+                    block.insert(block.end(), front.data.begin(),
+                                 front.data.begin() + need);
+                    front.data.erase(front.data.begin(),
+                                     front.data.begin() + need);
                     taken += need;
                     queue.queuedBytes -= need;
                 }
             }
 
             return block;
-        };
-
-        // 队列超过目标水位时，从队头丢掉多余的部分追赶实时。
-        //
-        // 用迟滞避免“丢一点、补一点、再丢一点”的来回震荡：
-        // 只有积压超过目标水位的 2 倍才动手，且一次丢到目标水位。
-        // 这样丢得少、丢得集中，听感上是偶发的一次跳音。
-        const auto trimSendQueue = [&]() {
-            size_t dropped = 0;
-
-            {
-                std::lock_guard<std::mutex> lock(queue.mutex);
-                const size_t trimThreshold = targetQueuedBytes * 2;
-                if (queue.queuedBytes <= trimThreshold)
-                    return;
-
-                size_t excess = queue.queuedBytes - targetQueuedBytes;
-
-                while (excess > 0 && !queue.blocks.empty()) {
-                    std::vector<BYTE>& front = queue.blocks.front();
-                    if (front.size() <= excess) {
-                        excess -= front.size();
-                        dropped += front.size();
-                        queue.queuedBytes -= front.size();
-                        queue.blocks.pop_front();
-                    } else {
-                        front.erase(front.begin(), front.begin() + excess);
-                        dropped += excess;
-                        queue.queuedBytes -= excess;
-                        excess = 0;
-                    }
-                }
-            }
-
-            if (dropped > 0) {
-                std::wcout << L"Send queue backlog; dropped "
-                           << static_cast<long long>(
-                                  static_cast<double>(dropped) /
-                                  sendBytesPerMs)
-                           << L" ms to catch up.\n";
-            }
         };
 
         // 采集线程：只把 WASAPI 数据搬进队列，绝不等网络。
@@ -1826,10 +1842,8 @@ int wmain(int argc, wchar_t* argv[])
             std::thread worker([&queue, &captureStop, &captureFault,
                                 &format, &sampleType, &captureClient,
                                 &audioCaptureEvent, &qpcFrequency,
-                                &dropUnitFrames, &sendBytesPerMs,
-                                &enqueuePcm]() {
+                                &enqueuePcm, &captureDropActive]() {
                 std::vector<int16_t> capturePcm;
-                bool captureDropActive = false;
                 bool captureTimestampWarned = false;
 
                 while (!g_stop.load() && !captureStop.load()) {
@@ -1871,67 +1885,21 @@ int wmain(int argc, wchar_t* argv[])
                             break;
                         }
 
-                        // 这一包音频在 WASAPI 里等了多久，衡量采集侧积压。
+                        // 这一包是否带可用的时间戳。
+                        // 具体“有多旧”由 enqueuePcm 统一判断。
                         bool timestampAvailable =
                             (flags &
                              AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 &&
                             qpcPosition != 0;
-                        double packetAgeMs = 0.0;
-                        if (timestampAvailable) {
-                            LARGE_INTEGER currentQpc{};
-                            if (QueryPerformanceCounter(&currentQpc)) {
-                                const double currentQpc100ns =
-                                    static_cast<double>(currentQpc.QuadPart) *
-                                    10000000.0 /
-                                    static_cast<double>(
-                                        qpcFrequency.QuadPart);
-                                packetAgeMs = std::max(
-                                    0.0,
-                                    (currentQpc100ns -
-                                     static_cast<double>(qpcPosition)) /
-                                        10000.0);
-                            }
-                        } else if (!captureTimestampWarned) {
+                        if (!timestampAvailable && !captureTimestampWarned) {
                             std::wcerr
                                 << L"WASAPI packet timestamp unavailable; using write-time fallback for this capture session.\n";
                             captureTimestampWarned = true;
                         }
 
-                        // 采集侧只看 WASAPI 自己的积压。
-                        // 发送队列的积压由发送侧的 2 倍速追赶负责，
-                        // 两边都管同一份延迟会重复丢弃、听起来更碎。
-                        const double latencyMs = packetAgeMs;
-
-                        // 超过 kDropBacklogMs 就丢最旧的音频追赶实时。
-                        uint64_t dropThisPacket = 0;
-                        if (latencyMs > kDropBacklogMs) {
-                            const double excessMs =
-                                latencyMs - kDropBacklogMs;
-                            dropThisPacket =
-                                static_cast<uint64_t>(std::ceil(
-                                    excessMs * format->nSamplesPerSec /
-                                    1000.0));
-                            // 延迟已经大到 kDropAllBacklogMs 时不再做 2 倍速，
-                            // 直接整段丢掉：否则用户要听很久的快进才追上实时。
-                            if (latencyMs < kDropAllBacklogMs) {
-                                // 单包最多丢一半，剩下按 kDropUnitMs 粒度交替
-                                // 丢/留，听感上是短暂 2 倍速，比整段跳过自然。
-                                dropThisPacket = std::min<uint64_t>(
-                                    dropThisPacket,
-                                    static_cast<uint64_t>(frames) / 2);
-                            }
-                            if (!captureDropActive) {
-                                std::wcout
-                                    << L"Capture latency "
-                                    << static_cast<long long>(latencyMs)
-                                    << L" ms; dropping stale audio.\n";
-                                captureDropActive = true;
-                            }
-                        } else if (captureDropActive) {
-                            std::wcout << L"Capture backlog cleared.\n";
-                            captureDropActive = false;
-                        }
-
+                        // 丢帧不再在这里做：交给 enqueuePcm 按 WASAPI 时间戳
+                        // 判断这段音频有多旧，只保留最新的部分。
+                        // 这里只负责把这一包转成 s16 并带上它的时间戳。
                         if (frames > 0 && data != nullptr) {
                             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                                 // 静音包：内存内容未定义，按零处理。
@@ -1948,54 +1916,8 @@ int wmain(int argc, wchar_t* argv[])
                                 break;
                             }
 
-                            if (dropThisPacket > 0) {
-                                // 按 kDropUnitMs 粒度交替丢/留，
-                                // 留下的是压缩后的音频。
-                                std::vector<int16_t> kept;
-                                kept.reserve(capturePcm.size());
-                                uint64_t dropped = 0;
-                                bool dropNext = true;
-                                UINT32 frameOffset = 0;
-
-                                while (frameOffset < frames) {
-                                    const UINT32 take = static_cast<UINT32>(
-                                        std::min<uint64_t>(
-                                            dropUnitFrames,
-                                            static_cast<uint64_t>(frames) -
-                                                frameOffset));
-                                    const UINT32 dropCount =
-                                        (dropNext &&
-                                         dropped < dropThisPacket)
-                                            ? static_cast<UINT32>(
-                                                  std::min<uint64_t>(
-                                                      take,
-                                                      dropThisPacket -
-                                                          dropped))
-                                            : 0;
-                                    dropped += dropCount;
-
-                                    if (take > dropCount) {
-                                        const int16_t* src =
-                                            capturePcm.data() +
-                                            static_cast<size_t>(
-                                                frameOffset + dropCount) *
-                                                format->nChannels;
-                                        kept.insert(
-                                            kept.end(), src,
-                                            src +
-                                                static_cast<size_t>(
-                                                    take - dropCount) *
-                                                    format->nChannels);
-                                    }
-
-                                    frameOffset += take;
-                                    dropNext = !dropNext;
-                                }
-
-                                enqueuePcm(kept);
-                            } else {
-                                enqueuePcm(capturePcm);
-                            }
+                            enqueuePcm(capturePcm, qpcPosition, frames,
+                                       timestampAvailable);
                         }
 
                         captureClient->ReleaseBuffer(frames);
@@ -2212,9 +2134,6 @@ int wmain(int argc, wchar_t* argv[])
             // 不需要另建一个定时器去追——那正是之前 95% 速率的来源：
             // sleep_until 睡过头，节拍又把它重置掉，误差就永久累积了。
             if (connected) {
-                // 积压太多时先丢一段，追回实时。
-                trimSendQueue();
-
                 // 攒够最小写出量再发，避免 WASAPI 包很小时写调用过碎。
                 // 这个下限只是把碎片合并，不会引入节拍或累积误差。
                 size_t readyBytes = 0;
@@ -2268,10 +2187,36 @@ int wmain(int argc, wchar_t* argv[])
                             ? sentMs / (elapsedSec * 1000.0)
                             : 0.0;
 
+                    // 队列头那块音频有多旧：这是最接近“用户听到的延迟”的数字。
+                    double headAgeMs = -1.0;
+                    {
+                        std::lock_guard<std::mutex> lock(queue.mutex);
+                        if (!queue.blocks.empty() &&
+                            queue.blocks.front().hasTimestamp) {
+                            LARGE_INTEGER nowQpc{};
+                            if (QueryPerformanceCounter(&nowQpc)) {
+                                const double now100ns =
+                                    static_cast<double>(nowQpc.QuadPart) *
+                                    10000000.0 /
+                                    static_cast<double>(qpcFrequency.QuadPart);
+                                const PcmBlock& head = queue.blocks.front();
+                                const double end100ns =
+                                    static_cast<double>(head.qpcStart) +
+                                    static_cast<double>(head.frames) *
+                                        10000000.0 /
+                                        static_cast<double>(
+                                            format->nSamplesPerSec);
+                                headAgeMs = (now100ns - end100ns) / 10000.0;
+                            }
+                        }
+                    }
+
                     std::wcout
                         << L"[send] queued "
                         << static_cast<long long>(
                                static_cast<double>(queuedNow) / sendBytesPerMs)
+                        << L" ms; age "
+                        << static_cast<long long>(headAgeMs)
                         << L" ms; sent "
                         << static_cast<long long>(sentMs)
                         << L" ms in "
