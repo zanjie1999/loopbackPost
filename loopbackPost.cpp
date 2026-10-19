@@ -1652,7 +1652,12 @@ int wmain(int argc, wchar_t* argv[])
                 static_cast<double>(format->nSamplesPerSec) *
                 kDropUnitMs / 1000.0));
 
-        // 一次写出的目标字节数（s16le）。
+        // 一次最多写出多少字节（s16le）。
+        //
+        // 发送不再按固定节拍，而是“有数据就发”，由采集线程的数据到达驱动。
+        // 采集线程本来就是被 WASAPI 事件唤醒的，事件频率就是音频产生的频率，
+        // 所以发送速率天然等于实时速率，不会像定时器那样累积误差。
+        // 这里只是单次写出的上限，避免一次写太多导致长阻塞。
         const size_t sendBytesPerFrame =
             static_cast<size_t>(format->nChannels) * sizeof(int16_t);
         const size_t sendChunkBytes = std::max<size_t>(
@@ -1666,18 +1671,20 @@ int wmain(int argc, wchar_t* argv[])
             static_cast<double>(sendBytesPerFrame) / 1000.0;
 
         // 队列硬上限：只用来兜住病态情况（比如服务端卡死），不参与日常调节。
-        // 日常的延迟控制靠“目标水位 + 2 倍速追赶”，见 takeSendBlock。
         const size_t maxQueuedBytes = std::max<size_t>(
             sendChunkBytes * 8,
             static_cast<size_t>(sendBytesPerMs * kDropAllBacklogMs));
 
-        // 队列目标水位：超过就丢最旧的音频，把积压压回去。
-        //
-        // 注意要加上“一块的固有延迟”：正常播放时队列里总压着待发的一块，
-        // 目标水位若等于 kDropBacklogMs，几乎每个节拍都会触发丢弃，
-        // 听起来就是持续被切碎。所以目标水位 = 一块 + kDropBacklogMs。
+        // 队列目标水位：积压超过这个量就从队头丢，追回实时。
+        // 因为不再有节拍，队列里正常只有采集侧最近几毫秒的数据，
+        // 所以这里直接用 kDropBacklogMs 作为目标。
         const size_t targetQueuedBytes = static_cast<size_t>(
-            sendBytesPerMs * (kSendChunkMs + kDropBacklogMs));
+            sendBytesPerMs * kDropBacklogMs);
+
+        // 最小写出量：攒够这么多再写一次，避免 WASAPI 包很小时写调用过碎。
+        // 取 5ms，比常见的 WASAPI 包周期（10ms）小，不会引入额外延迟。
+        const size_t minSendBytes = std::max<size_t>(
+            1, static_cast<size_t>(sendBytesPerMs * 5.0));
 
         // 采集与发送之间的队列，以及采集线程。
         PcmQueue queue;
@@ -1687,7 +1694,6 @@ int wmain(int argc, wchar_t* argv[])
         // captureFault：采集线程自己出错（设备被拔、GetBuffer 失败）。
         std::atomic_bool captureStop{false};
         std::atomic_bool captureFault{false};
-        auto sendDeadline = std::chrono::steady_clock::now();
 
         // 发送侧诊断：每 5 秒打一次队列深度和实际发送速率。
         auto lastDiagTime = std::chrono::steady_clock::now();
@@ -1735,14 +1741,16 @@ int wmain(int argc, wchar_t* argv[])
             std::lock_guard<std::mutex> lock(queue.mutex);
             queue.blocks.clear();
             queue.queuedBytes = 0;
-            sendDeadline = std::chrono::steady_clock::now();
         };
 
-        // 从队头取一块。取不满也照发，避免为了凑满增加延迟。
+        // 从队头取走当前所有可用数据（最多 sendChunkBytes）。
+        // 没有节拍要凑，取到多少就发多少。
         const auto takeSendBlock = [&]() {
             std::vector<BYTE> block;
             std::lock_guard<std::mutex> lock(queue.mutex);
 
+            // 有数据就全取走（最多 sendChunkBytes），
+            // 这样写出的块大小就等于采集侧刚到的量，不需要节拍去凑。
             size_t taken = 0;
             while (taken < sendChunkBytes && !queue.blocks.empty()) {
                 std::vector<BYTE>& front = queue.blocks.front();
@@ -1766,15 +1774,9 @@ int wmain(int argc, wchar_t* argv[])
 
         // 队列超过目标水位时，从队头丢掉多余的部分追赶实时。
         //
-        // 这里不在每块里小口切，而是攒到明显的积压才动一次：
-        // 一次丢掉的量较大、但频率低，听感上是偶发的短暂跳音，
-        // 而不是持续的“卡卡卡”。
-        // 队列超过目标水位时，从队头丢掉多余的部分追赶实时。
-        //
         // 用迟滞避免“丢一点、补一点、再丢一点”的来回震荡：
         // 只有积压超过目标水位的 2 倍才动手，且一次丢到目标水位。
-        // 这样丢得少、丢得集中，听感上是偶发的一次跳音，
-        // 而不是持续的“卡卡卡”。
+        // 这样丢得少、丢得集中，听感上是偶发的一次跳音。
         const auto trimSendQueue = [&]() {
             size_t dropped = 0;
 
@@ -2176,28 +2178,35 @@ int wmain(int argc, wchar_t* argv[])
                 }
             }
 
-            // 采集在独立线程里跑，主循环只按固定节拍从队列取块写出。
+            // 采集在独立线程里跑，主循环只负责把队列里的数据写出去。
             // 这样 socket 发送缓冲满的时候，阻塞的只有发送这一侧，
             // 采集侧不会跟着积压，queued audio age 也就不会滚到几百毫秒。
             if (connected && !captureRunning)
                 startCaptureThread();
 
-            // 发送：队列里有多少就发多少，但每次最多发一块。
+            // 发送：有数据就发，由采集线程的数据到达驱动。
             //
-            // 关键：节拍必须按“实际发出去的音频时长”推进，不能固定推 10ms。
-            // 否则队列里只有 3ms 数据时，发 3ms 却推进 10ms 节拍，
-            // 发送速率就只有实时的 30%，听起来就是慢放，队列永远排不空。
+            // 采集线程被 WASAPI 事件唤醒，事件频率就是音频产生的频率，
+            // 所以“有数据就发”的发送速率天然等于实时速率，
+            // 不需要另建一个定时器去追——那正是之前 95% 速率的来源：
+            // sleep_until 睡过头，节拍又把它重置掉，误差就永久累积了。
             if (connected) {
-                // 先看看队列是否已经明显积压，需要丢一段追赶实时。
+                // 积压太多时先丢一段，追回实时。
                 trimSendQueue();
 
-                std::vector<BYTE> block = takeSendBlock();
+                // 攒够最小写出量再发，避免 WASAPI 包很小时写调用过碎。
+                // 这个下限只是把碎片合并，不会引入节拍或累积误差。
+                size_t readyBytes = 0;
+                {
+                    std::lock_guard<std::mutex> lock(queue.mutex);
+                    readyBytes = queue.queuedBytes;
+                }
+
+                std::vector<BYTE> block;
+                if (readyBytes >= minSendBytes)
+                    block = takeSendBlock();
 
                 if (!block.empty()) {
-                    // 这一块实际代表多少毫秒音频。
-                    const double blockMs =
-                        static_cast<double>(block.size()) / sendBytesPerMs;
-
                     if (!WritePcm(request, block.data(),
                                   static_cast<DWORD>(block.size()))) {
                         connected = false;
@@ -2212,29 +2221,16 @@ int wmain(int argc, wchar_t* argv[])
                             std::wcout
                                 << L"Connected. Audio data flowing.\n";
                         }
+                        diagSentBytes += block.size();
                     }
-
-                    // 节拍按实际发出去的音频时长推进。
-                    sendDeadline += std::chrono::microseconds(
-                        static_cast<long long>(blockMs * 1000.0));
-                    diagSentBytes += block.size();
                 } else {
-                    // 队列暂时空了：等采集线程填一点，别空转吃满 CPU。
+                    // 队列空了：等采集线程填数据。
+                    // 采集侧的事件周期约 10ms，睡 1ms 足够及时醒来。
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(1));
                 }
 
-                // 写阻塞过久时，sendDeadline 会落在过去，重新对齐即可，
-                // 绝不补发——补发正是把音频堆进内核发送缓冲的元凶。
-                const auto after = std::chrono::steady_clock::now();
-                if (sendDeadline < after) {
-                    sendDeadline = after;
-                } else {
-                    std::this_thread::sleep_until(sendDeadline);
-                }
-
                 // 每 5 秒打一次发送侧状态：队列深度、发送速率、写入耗时。
-                // 队列持续增长就说明发送慢于实时，这里能直接看出来。
                 const auto nowDiag = std::chrono::steady_clock::now();
                 if (nowDiag - lastDiagTime >= std::chrono::seconds(5)) {
                     const double elapsedSec =
