@@ -2032,9 +2032,32 @@ int wmain(int argc, wchar_t* argv[])
             clearSendQueue();
         };
 
-        while (!g_stop.load()) {
-            HandlePendingVolumeRequests(activeParts);
+        // 音量请求走独立线程：SendVolumeRequest 是同步 HTTP 调用，
+        // 超时 1 秒，跑在发送线程上会把音频卡住最多 1 秒，
+        // 期间队列持续积累，恢复后只能丢掉一大段（实测 270ms）。
+        std::atomic_bool volumeThreadStop{false};
+        std::thread volumeThread;
 
+        const auto startVolumeThread = [&]() {
+            volumeThreadStop.store(false);
+            volumeThread = std::thread([&]() {
+                while (!g_stop.load() && !volumeThreadStop.load()) {
+                    HandlePendingVolumeRequests(activeParts);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(20));
+                }
+            });
+        };
+
+        const auto stopVolumeThread = [&]() {
+            volumeThreadStop.store(true);
+            if (volumeThread.joinable())
+                volumeThread.join();
+        };
+
+        startVolumeThread();
+
+        while (!g_stop.load()) {
             if (!connected) {
                 if (serviceRetryDelay) {
                     SleepWhileHandlingVolumeRequests(
@@ -2140,14 +2163,12 @@ int wmain(int argc, wchar_t* argv[])
                 if (!reconnectRequested && (key == 0 || key == 224)) {
                     const int arrow = _getch();
 
+                    // 只投递请求，由音量线程去做同步 HTTP，
+                    // 避免把发送线程卡住导致音频积压。
                     if (arrow == 72) {
-                        if (SendVolumeRequest(activeParts, L"/volp")) {
-                            std::wcout << L"Volume up.\n";
-                        }
+                        ++g_volumeUpRequests;
                     } else if (arrow == 80) {
-                        if (SendVolumeRequest(activeParts, L"/volm")) {
-                            std::wcout << L"Volume down.\n";
-                        }
+                        ++g_volumeDownRequests;
                     }
 
                     continue;
@@ -2376,6 +2397,7 @@ int wmain(int argc, wchar_t* argv[])
             }
         }
 
+        stopVolumeThread();
         stopCaptureThread();
         audioClient->Stop();
 
