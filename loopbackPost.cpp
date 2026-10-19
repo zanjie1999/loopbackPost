@@ -1671,11 +1671,13 @@ int wmain(int argc, wchar_t* argv[])
             sendChunkBytes * 8,
             static_cast<size_t>(sendBytesPerMs * kDropAllBacklogMs));
 
-        // 队列目标水位：超过就按 2 倍速追赶，把积压放掉。
-        // 接收端 aplay 按固定采样率播放，发送更快只会让数据堆在接收端，
-        // 所以追赶的唯一手段是多丢一点音频，而不是多发。
+        // 队列目标水位：超过就丢最旧的音频，把积压压回去。
+        //
+        // 注意要加上“一块的固有延迟”：正常播放时队列里总压着待发的一块，
+        // 目标水位若等于 kDropBacklogMs，几乎每个节拍都会触发丢弃，
+        // 听起来就是持续被切碎。所以目标水位 = 一块 + kDropBacklogMs。
         const size_t targetQueuedBytes = static_cast<size_t>(
-            sendBytesPerMs * kDropBacklogMs);
+            sendBytesPerMs * (kSendChunkMs + kDropBacklogMs));
 
         // 采集与发送之间的队列，以及采集线程。
         PcmQueue queue;
@@ -1687,7 +1689,15 @@ int wmain(int argc, wchar_t* argv[])
         std::atomic_bool captureFault{false};
         auto sendDeadline = std::chrono::steady_clock::now();
 
+        // 发送侧诊断：每 5 秒打一次队列深度和实际发送速率。
+        auto lastDiagTime = std::chrono::steady_clock::now();
+        size_t diagSentBytes = 0;
+
         // 把 PCM 入队。采集线程只做这一步，永远不等网络。
+        //
+        // 队列达到硬上限时必须丢最旧的音频，否则延迟会无限增长。
+        // 这里是“兜底”路径，正常情况下不该触发；一旦触发说明发送
+        // 长期慢于实时，所以必须打日志，不能静默丢弃。
         const auto enqueuePcm = [&](const std::vector<int16_t>& pcm) {
             if (pcm.empty())
                 return;
@@ -1695,14 +1705,30 @@ int wmain(int argc, wchar_t* argv[])
             const BYTE* bytes = reinterpret_cast<const BYTE*>(pcm.data());
             const size_t size = pcm.size() * sizeof(int16_t);
 
-            std::lock_guard<std::mutex> lock(queue.mutex);
-            while (queue.queuedBytes + size > maxQueuedBytes &&
-                   !queue.blocks.empty()) {
-                queue.queuedBytes -= queue.blocks.front().size();
-                queue.blocks.pop_front();
+            size_t droppedBytes = 0;
+            {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                while (queue.queuedBytes + size > maxQueuedBytes &&
+                       !queue.blocks.empty()) {
+                    droppedBytes += queue.blocks.front().size();
+                    queue.queuedBytes -= queue.blocks.front().size();
+                    queue.blocks.pop_front();
+                }
+                queue.queuedBytes += size;
+                queue.blocks.emplace_back(bytes, bytes + size);
             }
-            queue.queuedBytes += size;
-            queue.blocks.emplace_back(bytes, bytes + size);
+
+            if (droppedBytes > 0) {
+                std::wcout << L"Send queue hit hard limit ("
+                           << static_cast<long long>(
+                                  static_cast<double>(maxQueuedBytes) /
+                                  sendBytesPerMs)
+                           << L" ms); dropped "
+                           << static_cast<long long>(
+                                  static_cast<double>(droppedBytes) /
+                                  sendBytesPerMs)
+                           << L" ms. Sender is slower than realtime.\n";
+            }
         };
 
         const auto clearSendQueue = [&]() {
@@ -1713,10 +1739,6 @@ int wmain(int argc, wchar_t* argv[])
         };
 
         // 从队头取一块。取不满也照发，避免为了凑满增加延迟。
-        //
-        // 队列超过目标水位时按 2 倍速追赶：正常发一块之后，
-        // 再从队头丢掉等量的旧音频。接收端按固定采样率播放，
-        // 只有真的少发音频，积压才会下降；多发送只会堆在接收端。
         const auto takeSendBlock = [&]() {
             std::vector<BYTE> block;
             std::lock_guard<std::mutex> lock(queue.mutex);
@@ -1739,27 +1761,54 @@ int wmain(int argc, wchar_t* argv[])
                 }
             }
 
-            // 取完之后如果仍高于目标水位，就从队头丢，追回实时。
-            // 丢弃量上限等于本块大小，也就是最多 2 倍速。
-            size_t dropExtra = 0;
-            if (queue.queuedBytes > targetQueuedBytes)
-                dropExtra = std::min(block.size(),
-                                     queue.queuedBytes - targetQueuedBytes);
+            return block;
+        };
 
-            while (dropExtra > 0 && !queue.blocks.empty()) {
-                std::vector<BYTE>& front = queue.blocks.front();
-                if (front.size() <= dropExtra) {
-                    dropExtra -= front.size();
-                    queue.queuedBytes -= front.size();
-                    queue.blocks.pop_front();
-                } else {
-                    front.erase(front.begin(), front.begin() + dropExtra);
-                    queue.queuedBytes -= dropExtra;
-                    dropExtra = 0;
+        // 队列超过目标水位时，从队头丢掉多余的部分追赶实时。
+        //
+        // 这里不在每块里小口切，而是攒到明显的积压才动一次：
+        // 一次丢掉的量较大、但频率低，听感上是偶发的短暂跳音，
+        // 而不是持续的“卡卡卡”。
+        // 队列超过目标水位时，从队头丢掉多余的部分追赶实时。
+        //
+        // 用迟滞避免“丢一点、补一点、再丢一点”的来回震荡：
+        // 只有积压超过目标水位的 2 倍才动手，且一次丢到目标水位。
+        // 这样丢得少、丢得集中，听感上是偶发的一次跳音，
+        // 而不是持续的“卡卡卡”。
+        const auto trimSendQueue = [&]() {
+            size_t dropped = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(queue.mutex);
+                const size_t trimThreshold = targetQueuedBytes * 2;
+                if (queue.queuedBytes <= trimThreshold)
+                    return;
+
+                size_t excess = queue.queuedBytes - targetQueuedBytes;
+
+                while (excess > 0 && !queue.blocks.empty()) {
+                    std::vector<BYTE>& front = queue.blocks.front();
+                    if (front.size() <= excess) {
+                        excess -= front.size();
+                        dropped += front.size();
+                        queue.queuedBytes -= front.size();
+                        queue.blocks.pop_front();
+                    } else {
+                        front.erase(front.begin(), front.begin() + excess);
+                        dropped += excess;
+                        queue.queuedBytes -= excess;
+                        excess = 0;
+                    }
                 }
             }
 
-            return block;
+            if (dropped > 0) {
+                std::wcout << L"Send queue backlog; dropped "
+                           << static_cast<long long>(
+                                  static_cast<double>(dropped) /
+                                  sendBytesPerMs)
+                           << L" ms to catch up.\n";
+            }
         };
 
         // 采集线程：只把 WASAPI 数据搬进队列，绝不等网络。
@@ -2139,6 +2188,9 @@ int wmain(int argc, wchar_t* argv[])
             // 否则队列里只有 3ms 数据时，发 3ms 却推进 10ms 节拍，
             // 发送速率就只有实时的 30%，听起来就是慢放，队列永远排不空。
             if (connected) {
+                // 先看看队列是否已经明显积压，需要丢一段追赶实时。
+                trimSendQueue();
+
                 std::vector<BYTE> block = takeSendBlock();
 
                 if (!block.empty()) {
@@ -2165,6 +2217,7 @@ int wmain(int argc, wchar_t* argv[])
                     // 节拍按实际发出去的音频时长推进。
                     sendDeadline += std::chrono::microseconds(
                         static_cast<long long>(blockMs * 1000.0));
+                    diagSentBytes += block.size();
                 } else {
                     // 队列暂时空了：等采集线程填一点，别空转吃满 CPU。
                     std::this_thread::sleep_for(
@@ -2178,6 +2231,47 @@ int wmain(int argc, wchar_t* argv[])
                     sendDeadline = after;
                 } else {
                     std::this_thread::sleep_until(sendDeadline);
+                }
+
+                // 每 5 秒打一次发送侧状态：队列深度、发送速率、写入耗时。
+                // 队列持续增长就说明发送慢于实时，这里能直接看出来。
+                const auto nowDiag = std::chrono::steady_clock::now();
+                if (nowDiag - lastDiagTime >= std::chrono::seconds(5)) {
+                    const double elapsedSec =
+                        std::chrono::duration<double>(nowDiag - lastDiagTime)
+                            .count();
+                    size_t queuedNow = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(queue.mutex);
+                        queuedNow = queue.queuedBytes;
+                    }
+                    const double sentMs = diagSentBytes / sendBytesPerMs;
+                    const double realtimeRatio =
+                        elapsedSec > 0.0
+                            ? sentMs / (elapsedSec * 1000.0)
+                            : 0.0;
+
+                    std::wcout
+                        << L"[send] queued "
+                        << static_cast<long long>(
+                               static_cast<double>(queuedNow) / sendBytesPerMs)
+                        << L" ms; sent "
+                        << static_cast<long long>(sentMs)
+                        << L" ms in "
+                        << static_cast<long long>(elapsedSec * 1000.0)
+                        << L" ms ("
+                        << static_cast<long long>(realtimeRatio * 100.0)
+                        << L"% of realtime); write max "
+                        << static_cast<long long>(g_writeMaxMs)
+                        << L" ms, >=1ms "
+                        << g_writeOver1MsCalls << L"/" << g_writeCalls
+                        << L"\n";
+
+                    lastDiagTime = nowDiag;
+                    diagSentBytes = 0;
+                    g_writeCalls = 0;
+                    g_writeOver1MsCalls = 0;
+                    g_writeMaxMs = 0.0;
                 }
             }
 
