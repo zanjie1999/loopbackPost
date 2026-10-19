@@ -1665,11 +1665,17 @@ int wmain(int argc, wchar_t* argv[])
             static_cast<double>(format->nSamplesPerSec) *
             static_cast<double>(sendBytesPerFrame) / 1000.0;
 
-        // 队列上限：攒到这么多音频就丢最旧的，避免延迟越滚越大。
-        // 留出几个节拍的余量，正常的采集/发送抖动不会触发丢弃。
+        // 队列硬上限：只用来兜住病态情况（比如服务端卡死），不参与日常调节。
+        // 日常的延迟控制靠“目标水位 + 2 倍速追赶”，见 takeSendBlock。
         const size_t maxQueuedBytes = std::max<size_t>(
-            sendChunkBytes * 3,
-            static_cast<size_t>(sendBytesPerMs * kDropBacklogMs * 2));
+            sendChunkBytes * 8,
+            static_cast<size_t>(sendBytesPerMs * kDropAllBacklogMs));
+
+        // 队列目标水位：超过就按 2 倍速追赶，把积压放掉。
+        // 接收端 aplay 按固定采样率播放，发送更快只会让数据堆在接收端，
+        // 所以追赶的唯一手段是多丢一点音频，而不是多发。
+        const size_t targetQueuedBytes = static_cast<size_t>(
+            sendBytesPerMs * kDropBacklogMs);
 
         // 采集与发送之间的队列，以及采集线程。
         PcmQueue queue;
@@ -1707,6 +1713,10 @@ int wmain(int argc, wchar_t* argv[])
         };
 
         // 从队头取一块。取不满也照发，避免为了凑满增加延迟。
+        //
+        // 队列超过目标水位时按 2 倍速追赶：正常发一块之后，
+        // 再从队头丢掉等量的旧音频。接收端按固定采样率播放，
+        // 只有真的少发音频，积压才会下降；多发送只会堆在接收端。
         const auto takeSendBlock = [&]() {
             std::vector<BYTE> block;
             std::lock_guard<std::mutex> lock(queue.mutex);
@@ -1728,6 +1738,27 @@ int wmain(int argc, wchar_t* argv[])
                     queue.queuedBytes -= need;
                 }
             }
+
+            // 取完之后如果仍高于目标水位，就从队头丢，追回实时。
+            // 丢弃量上限等于本块大小，也就是最多 2 倍速。
+            size_t dropExtra = 0;
+            if (queue.queuedBytes > targetQueuedBytes)
+                dropExtra = std::min(block.size(),
+                                     queue.queuedBytes - targetQueuedBytes);
+
+            while (dropExtra > 0 && !queue.blocks.empty()) {
+                std::vector<BYTE>& front = queue.blocks.front();
+                if (front.size() <= dropExtra) {
+                    dropExtra -= front.size();
+                    queue.queuedBytes -= front.size();
+                    queue.blocks.pop_front();
+                } else {
+                    front.erase(front.begin(), front.begin() + dropExtra);
+                    queue.queuedBytes -= dropExtra;
+                    dropExtra = 0;
+                }
+            }
+
             return block;
         };
 
@@ -1815,19 +1846,10 @@ int wmain(int argc, wchar_t* argv[])
                             captureTimestampWarned = true;
                         }
 
-                        size_t queuedBytes = 0;
-                        {
-                            std::lock_guard<std::mutex> lock(queue.mutex);
-                            queuedBytes = queue.queuedBytes;
-                        }
-                        const double queuedMs =
-                            static_cast<double>(queuedBytes) /
-                            sendBytesPerMs;
-                        // 队列里本来就有一块待发（节拍固有延迟），
-                        // 这段不算积压，否则正常播放也会被判成拥塞。
-                        const double backlogMs =
-                            std::max(0.0, queuedMs - kSendChunkMs);
-                        const double latencyMs = packetAgeMs + backlogMs;
+                        // 采集侧只看 WASAPI 自己的积压。
+                        // 发送队列的积压由发送侧的 2 倍速追赶负责，
+                        // 两边都管同一份延迟会重复丢弃、听起来更碎。
+                        const double latencyMs = packetAgeMs;
 
                         // 超过 kDropBacklogMs 就丢最旧的音频追赶实时。
                         uint64_t dropThisPacket = 0;
@@ -1849,17 +1871,13 @@ int wmain(int argc, wchar_t* argv[])
                             }
                             if (!captureDropActive) {
                                 std::wcout
-                                    << L"Audio latency "
+                                    << L"Capture latency "
                                     << static_cast<long long>(latencyMs)
-                                    << L" ms (capture "
-                                    << static_cast<long long>(packetAgeMs)
-                                    << L" ms, queued "
-                                    << static_cast<long long>(queuedMs)
-                                    << L" ms); dropping stale audio.\n";
+                                    << L" ms; dropping stale audio.\n";
                                 captureDropActive = true;
                             }
                         } else if (captureDropActive) {
-                            std::wcout << L"Drop backlog cleared.\n";
+                            std::wcout << L"Capture backlog cleared.\n";
                             captureDropActive = false;
                         }
 
@@ -2115,17 +2133,19 @@ int wmain(int argc, wchar_t* argv[])
             if (connected && !captureRunning)
                 startCaptureThread();
 
-            // 发送：按固定节拍，每 kSendChunkMs 从队列头取一块写出。
-            // 落后时只重新对齐节拍，绝不补发突发——补发正是把音频
-            // 堆进内核发送缓冲、让延迟滚大的元凶。
+            // 发送：队列里有多少就发多少，但每次最多发一块。
+            //
+            // 关键：节拍必须按“实际发出去的音频时长”推进，不能固定推 10ms。
+            // 否则队列里只有 3ms 数据时，发 3ms 却推进 10ms 节拍，
+            // 发送速率就只有实时的 30%，听起来就是慢放，队列永远排不空。
             if (connected) {
-                const auto beforeWait = std::chrono::steady_clock::now();
-                if (sendDeadline > beforeWait)
-                    std::this_thread::sleep_until(sendDeadline);
-
                 std::vector<BYTE> block = takeSendBlock();
 
                 if (!block.empty()) {
+                    // 这一块实际代表多少毫秒音频。
+                    const double blockMs =
+                        static_cast<double>(block.size()) / sendBytesPerMs;
+
                     if (!WritePcm(request, block.data(),
                                   static_cast<DWORD>(block.size()))) {
                         connected = false;
@@ -2141,41 +2161,23 @@ int wmain(int argc, wchar_t* argv[])
                                 << L"Connected. Audio data flowing.\n";
                         }
                     }
+
+                    // 节拍按实际发出去的音频时长推进。
+                    sendDeadline += std::chrono::microseconds(
+                        static_cast<long long>(blockMs * 1000.0));
+                } else {
+                    // 队列暂时空了：等采集线程填一点，别空转吃满 CPU。
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(1));
                 }
 
-                // 拥塞日志：写调用阻塞了多少、队列里还压着多少。
-                if (g_blockedMs >= kDropBacklogMs) {
-                    const double dropMs = g_blockedMs;
-                    size_t queuedNow = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(queue.mutex);
-                        queuedNow = queue.queuedBytes;
-                    }
-                    std::wcout
-                        << L"Network congested (writes blocked "
-                        << static_cast<long long>(dropMs)
-                        << L" ms); queued audio "
-                        << static_cast<long long>(
-                               static_cast<double>(queuedNow) /
-                               sendBytesPerMs)
-                        << L" ms; WriteData calls=" << g_writeCalls
-                        << L", avg="
-                        << (g_writeCalls > 0
-                                ? dropMs / static_cast<double>(g_writeCalls)
-                                : 0.0)
-                        << L" ms, max=" << g_writeMaxMs
-                        << L" ms, >=1ms=" << g_writeOver1MsCalls
-                        << L"\n";
-                    ResetWriteStats();
-                }
-
-                // 推进节拍。写阻塞过久就重新对齐，绝不补发错过的节拍。
-                sendDeadline += std::chrono::microseconds(
-                    static_cast<long long>(kSendChunkMs * 1000.0));
+                // 写阻塞过久时，sendDeadline 会落在过去，重新对齐即可，
+                // 绝不补发——补发正是把音频堆进内核发送缓冲的元凶。
                 const auto after = std::chrono::steady_clock::now();
                 if (sendDeadline < after) {
-                    sendDeadline = after + std::chrono::microseconds(
-                        static_cast<long long>(kSendChunkMs * 1000.0));
+                    sendDeadline = after;
+                } else {
+                    std::this_thread::sleep_until(sendDeadline);
                 }
             }
 
