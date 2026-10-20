@@ -58,9 +58,10 @@ static DWORD g_lastWinHttpError = ERROR_SUCCESS;
 // 一旦明显超出就说明链路或进程卡了，必须丢。
 static double kDropBacklogMs = 20.0;
 
-// WASAPI 采集周期（毫秒）。0 表示用驱动报告的默认/最小周期。
-// 调大后每次 GetBuffer 拿到的音频更多、唤醒次数更少，抗抖动更稳，延迟略增。
-static double kCapturePeriodMs = 0.0;
+// 发送水位（毫秒）：队列里攒够这么多音频才写出去。
+// 调大就等于额外增加延迟，用来吸收网络抖动，让播放更稳；
+// 代价是端到端延迟变大，多设备同步时也能用更大的缓冲。
+static double kSendWaterMs = 5.0;
 
 // 队列硬上限（毫秒音频），只用来兜住服务端彻底卡死的病态情况。
 static double kDropAllBacklogMs = 500.0;
@@ -150,16 +151,6 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
         PrintHr(L"QueryInterface(IAudioClient3)", hr);
     }
 
-    // 命令行显式指定了采集周期就用它，否则沿用上面查到的默认值。
-    // 周期调大后每次 GetBuffer 拿到的音频更多、唤醒次数更少，
-    // 抗调度抖动更稳，代价是延迟略增。
-    if (kCapturePeriodMs > 0.0) {
-        bufferDuration = static_cast<REFERENCE_TIME>(
-            kCapturePeriodMs * 10000.0);
-        if (bufferDuration < 10000)  // 至少 1ms，避免非法值
-            bufferDuration = 10000;
-    }
-
     const auto reactivateAudioClient = [&]() -> bool {
         (*audioClient)->Release();
         *audioClient = nullptr;
@@ -228,10 +219,7 @@ static bool InitializeLowLatencyLoopback(IMMDevice* device,
         std::wcout << L"IAudioClient3 period query unavailable, requesting ";
     }
     std::wcout << (static_cast<double>(bufferDuration) / 10000.0)
-               << L" ms";
-    if (kCapturePeriodMs > 0.0)
-        std::wcout << L" (from argv[2])";
-    std::wcout << L"\n";
+               << L" ms\n";
     return true;
 }
 
@@ -1199,12 +1187,14 @@ int wmain(int argc, wchar_t* argv[])
 
     // 命令行参数：
     //   argv[1] 目标地址
-    //   argv[2] WASAPI 采集周期 ms（0 或省略 = 用驱动默认值）
+    //   argv[2] 发送水位 ms（多攒这么多音频才发，等于额外增加延迟）
     //   argv[3] 允许的最大音频年龄 ms，超过就丢旧音频
     //   argv[4] 队列硬上限 ms（兜底，正常不该触发）
 
     if (argc >= 3) {
-        kCapturePeriodMs = std::wcstod(argv[2], nullptr);
+        kSendWaterMs = std::wcstod(argv[2], nullptr);
+        if (kSendWaterMs < 0.0)
+            kSendWaterMs = 0.0;
     }
 
     if (argc >= 4) {
@@ -1389,6 +1379,12 @@ int wmain(int argc, wchar_t* argv[])
             << L"Streaming PCM to: "
             << finalUrl
             << L"\n";
+
+        std::wcout
+            << L"Send watermark: " << kSendWaterMs
+            << L" ms (extra latency), drop above "
+            << std::max(kDropBacklogMs, kSendWaterMs + 10.0)
+            << L" ms\n";
 
         const auto closeHttp = [&]() {
             if (request) { WinHttpCloseHandle(request); request = nullptr; }
@@ -1701,10 +1697,18 @@ int wmain(int argc, wchar_t* argv[])
             sendChunkBytes * 8,
             static_cast<size_t>(sendBytesPerMs * kDropAllBacklogMs));
 
-        // 最小写出量：攒够这么多再写一次，避免 WASAPI 包很小时写调用过碎。
-        // 取 5ms，比常见的 WASAPI 包周期（10ms）小，不会引入额外延迟。
+        // 发送水位：队列里攒够这么多字节才写出去。
+        // 这就是 argv[2] 控制的“额外延迟”——攒得越多，越能吸收网络抖动，
+        // 但端到端延迟也越大。
         const size_t minSendBytes = std::max<size_t>(
-            1, static_cast<size_t>(sendBytesPerMs * 5.0));
+            1, static_cast<size_t>(sendBytesPerMs * kSendWaterMs));
+
+        // 实际的丢弃阈值。
+        // 必须比发送水位大，否则“攒够水位才发”和“超过阈值就丢”会互相打架：
+        // 攒到水位之前音频就已经被判定过旧而丢掉，水位永远攒不满。
+        // 留一个 WASAPI 周期的余量（10ms），保证水位能正常填满。
+        const double effectiveDropMs =
+            std::max(kDropBacklogMs, kSendWaterMs + 10.0);
 
         // 采集与发送之间的队列，以及采集线程。
         PcmQueue queue;
@@ -1714,10 +1718,6 @@ int wmain(int argc, wchar_t* argv[])
         // captureFault：采集线程自己出错（设备被拔、GetBuffer 失败）。
         std::atomic_bool captureStop{false};
         std::atomic_bool captureFault{false};
-
-        // 只在采集线程里用，记录当前是否处于“丢旧音频追赶”状态，
-        // 避免每包都重复打印。
-        bool captureDropActive = false;
 
         // 发送侧诊断：每 5 秒打一次队列深度和实际发送速率。
         auto lastDiagTime = std::chrono::steady_clock::now();
@@ -1734,6 +1734,10 @@ int wmain(int argc, wchar_t* argv[])
         // 之后所有 age 计算都减掉这个偏移，让日志里的 age 反映真实延迟。
         bool qpcOffsetValid = false;
         double qpcOffset100ns = 0.0;
+
+        // 两个日志状态分开，避免互相覆盖导致日志反复翻转。
+        bool captureDropActive = false;
+        bool queueTrimActive = false;
 
         // 把 WASAPI 时间戳换算成“这段音频现在有多旧”（毫秒）。
         // 返回值已经扣掉校准偏移；偏移尚未建立时返回 0（不丢）。
@@ -1774,9 +1778,9 @@ int wmain(int argc, wchar_t* argv[])
 
             if (hasTimestamp && format->nSamplesPerSec > 0) {
                 const double ageMs = computeAgeMs(qpcStart, frames);
-                if (ageMs > kDropBacklogMs) {
+                if (ageMs > effectiveDropMs) {
                     // 超出阈值多少毫秒，就从这段音频开头丢掉多少。
-                    const double excessMs = ageMs - kDropBacklogMs;
+                    const double excessMs = ageMs - effectiveDropMs;
                     uint64_t dropFrames = static_cast<uint64_t>(
                         std::ceil(excessMs * format->nSamplesPerSec /
                                   1000.0));
@@ -1865,7 +1869,7 @@ int wmain(int argc, wchar_t* argv[])
                                         format->nSamplesPerSec);
                             const double frontAgeMs =
                                 (now100ns - end100ns) / 10000.0;
-                            if (frontAgeMs <= kDropBacklogMs)
+                            if (frontAgeMs <= effectiveDropMs)
                                 break;
 
                             staleDropped += front.data.size();
@@ -1882,15 +1886,15 @@ int wmain(int argc, wchar_t* argv[])
             }
 
             if (staleDroppedMs > 0.0) {
-                if (!captureDropActive) {
+                if (!queueTrimActive) {
                     std::wcout << L"Queue backlog; dropped "
                                << static_cast<long long>(staleDroppedMs)
                                << L" ms of stale audio.\n";
-                    captureDropActive = true;
+                    queueTrimActive = true;
                 }
-            } else if (captureDropActive) {
+            } else if (queueTrimActive) {
                 std::wcout << L"Queue is fresh again.\n";
-                captureDropActive = false;
+                queueTrimActive = false;
             }
         };
 
@@ -1942,7 +1946,7 @@ int wmain(int argc, wchar_t* argv[])
             std::thread worker([&queue, &captureStop, &captureFault,
                                 &format, &sampleType, &captureClient,
                                 &audioCaptureEvent, &qpcFrequency,
-                                &enqueuePcm, &captureDropActive]() {
+                                &enqueuePcm]() {
                 std::vector<int16_t> capturePcm;
                 bool captureTimestampWarned = false;
 
@@ -2051,6 +2055,16 @@ int wmain(int argc, wchar_t* argv[])
             }
             captureStop.store(false);
             captureFault.store(false);
+
+            // 复位时间戳校准：WASAPI 重新 Start 后 qpcPosition 的基准可能变，
+            // 旧偏移不再成立，会让 age 系统性偏大、每包都超阈值，
+            // 表现为断连恢复后一直不停地丢 10ms。
+            // 让重连后的第一个包重新建立偏移。
+            qpcOffsetValid = false;
+            qpcOffset100ns = 0.0;
+            captureDropActive = false;
+            queueTrimActive = false;
+
             clearSendQueue();
         };
 
