@@ -99,7 +99,7 @@ static constexpr auto kCaptureGateTimeout = std::chrono::milliseconds(3000);
 // 建缓冲。这段时间里推过去的数据会被它按自己的节奏吞掉，各设备就吃进
 // 不同长度的“启动期缓冲”，播放起点也跟着错开。
 // 等它们都稳定下来再统一开始推流，各设备的起点才一致。
-static constexpr auto kCaptureSettleDelay = std::chrono::milliseconds(100);
+static constexpr auto kCaptureSettleDelay = std::chrono::milliseconds(250);
 
 
 // 队列里的一段 PCM（已转换成 s16le），带它在系统时钟上的位置。
