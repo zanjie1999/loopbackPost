@@ -1437,110 +1437,15 @@ int wmain(int argc, wchar_t* argv[])
             return false;
         }
 
-        hr = enumerator->GetDefaultAudioEndpoint(
-            eRender,
-            eMultimedia,
-            &device);
-
-        if (FAILED(hr)) {
-            PrintHr(L"GetDefaultAudioEndpoint", hr);
-            stopThreads();
-            return false;
-        }
-
-        hr = device->Activate(
-            __uuidof(IAudioClient),
-            CLSCTX_ALL,
-            nullptr,
-            reinterpret_cast<void**>(&audioClient));
-
-        if (FAILED(hr)) {
-            PrintHr(L"IMMDevice::Activate(IAudioClient)", hr);
-            stopThreads();
-            return false;
-        }
-
-        hr = audioClient->GetMixFormat(&format);
-
-        if (FAILED(hr)) {
-            PrintHr(L"IAudioClient::GetMixFormat", hr);
-            stopThreads();
-            return false;
-        }
-
-        const SampleType sampleType = GetSampleType(format);
-
-        if (sampleType == SampleType::UNSUPPORTED) {
-            std::wcerr
-                << L"Unsupported WASAPI sample format.\n";
-            stopThreads();
-            return false;
-        }
-
-        std::wcout
-            << L"Capture format: "
-            << format->nSamplesPerSec
-            << L" Hz, "
-            << format->nChannels
-            << L" ch, "
-            << format->wBitsPerSample
-            << L" bit, block="
-            << format->nBlockAlign;
-
-        if (format->wFormatTag == WAVE_FORMAT_PCM)
-            std::wcout << L", PCM";
-        else if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
-            std::wcout << L", IEEE float";
-        else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
-            std::wcout << L", WAVE_FORMAT_EXTENSIBLE";
-
-        std::wcout
-            << L", source="
-            << SampleTypeName(sampleType)
-            << L"\n";
-
         // 建立每一路目标。Destination 内含 mutex，用 unique_ptr 保证地址稳定。
+        // 采样率、声道数相关的字段由 openCapture 按实际采集格式填写。
         destinations.reserve(specs.size());
         for (size_t i = 0; i < specs.size(); ++i) {
             auto destination = std::make_unique<Destination>();
             destination->url = specs[i].url;
             destination->channelMode = specs[i].channelMode;
             destination->index = i;
-            ConfigureDestination(
-                *destination,
-                format->nSamplesPerSec,
-                format->nChannels);
             destinations.push_back(std::move(destination));
-        }
-
-        if (!InitializeLowLatencyLoopback(
-                device, &audioClient, format, audioCaptureEvent)) {
-            stopThreads();
-            return false;
-        }
-
-        // 共享模式下申请值不一定被采纳，把真实缓冲大小打出来。
-        UINT32 actualBufferFrames = 0;
-
-        if (SUCCEEDED(audioClient->GetBufferSize(&actualBufferFrames)) &&
-            format->nSamplesPerSec > 0) {
-            std::wcout
-                << L"Actual capture buffer: "
-                << actualBufferFrames
-                << L" frames ("
-                << (actualBufferFrames * 1000ULL) /
-                       format->nSamplesPerSec
-                << L" ms)\n";
-        }
-
-        hr = audioClient->GetService(
-            __uuidof(IAudioCaptureClient),
-            reinterpret_cast<void**>(&captureClient));
-
-        if (FAILED(hr)) {
-            PrintHr(L"IAudioClient::GetService(IAudioCaptureClient)", hr);
-            stopThreads();
-            return false;
         }
 
         if (!QueryPerformanceFrequency(&qpcFrequency) ||
@@ -1550,32 +1455,163 @@ int wmain(int argc, wchar_t* argv[])
             return false;
         }
 
-        std::wcout
-            << L"Output format: "
-            << format->nSamplesPerSec
-            << L" Hz, s16le\n";
+        SampleType sampleType = SampleType::UNSUPPORTED;
 
-        for (const auto& destination : destinations) {
-            const wchar_t* modeName =
-                destination->channelMode == ChannelMode::Left
-                    ? L"left"
-                    : (destination->channelMode == ChannelMode::Right
-                           ? L"right"
-                           : L"stereo");
+        // 打开默认输出设备的 loopback 采集。首次启动和每次按回车重连都会调用：
+        // 先释放上一次的采集对象，再重新读取当前的默认输出设备，
+        // 这样在系统里换了默认播放设备之后，按一下回车就能跟上。
+        const auto openCapture = [&]() -> bool {
+            if (captureClient) {
+                captureClient->Release();
+                captureClient = nullptr;
+            }
+
+            if (audioClient) {
+                audioClient->Stop();
+                audioClient->Release();
+                audioClient = nullptr;
+            }
+
+            if (device) {
+                device->Release();
+                device = nullptr;
+            }
+
+            if (format) {
+                CoTaskMemFree(format);
+                format = nullptr;
+            }
+
+            hr = enumerator->GetDefaultAudioEndpoint(
+                eRender,
+                eMultimedia,
+                &device);
+
+            if (FAILED(hr)) {
+                PrintHr(L"GetDefaultAudioEndpoint", hr);
+                return false;
+            }
+
+            hr = device->Activate(
+                __uuidof(IAudioClient),
+                CLSCTX_ALL,
+                nullptr,
+                reinterpret_cast<void**>(&audioClient));
+
+            if (FAILED(hr)) {
+                PrintHr(L"IMMDevice::Activate(IAudioClient)", hr);
+                return false;
+            }
+
+            hr = audioClient->GetMixFormat(&format);
+
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::GetMixFormat", hr);
+                return false;
+            }
+
+            sampleType = GetSampleType(format);
+
+            if (sampleType == SampleType::UNSUPPORTED) {
+                std::wcerr
+                    << L"Unsupported WASAPI sample format.\n";
+                return false;
+            }
 
             std::wcout
-                << L"Destination "
-                << (destination->index + 1)
-                << L": "
-                << modeName
-                << L", "
-                << destination->outChannels
-                << L" ch -> "
-                << BuildAudioUrl(
-                       destination->url,
-                       format->nSamplesPerSec,
-                       static_cast<WORD>(destination->outChannels))
+                << L"Capture format: "
+                << format->nSamplesPerSec
+                << L" Hz, "
+                << format->nChannels
+                << L" ch, "
+                << format->wBitsPerSample
+                << L" bit, block="
+                << format->nBlockAlign;
+
+            if (format->wFormatTag == WAVE_FORMAT_PCM)
+                std::wcout << L", PCM";
+            else if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+                std::wcout << L", IEEE float";
+            else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+                std::wcout << L", WAVE_FORMAT_EXTENSIBLE";
+
+            std::wcout
+                << L", source="
+                << SampleTypeName(sampleType)
                 << L"\n";
+
+            // 换设备后采样率/声道数可能变，每路的发送参数都要重算。
+            for (const auto& destination : destinations) {
+                ConfigureDestination(
+                    *destination,
+                    format->nSamplesPerSec,
+                    format->nChannels);
+            }
+
+            if (!InitializeLowLatencyLoopback(
+                    device, &audioClient, format, audioCaptureEvent)) {
+                return false;
+            }
+
+            // 共享模式下申请值不一定被采纳，把真实缓冲大小打出来。
+            UINT32 actualBufferFrames = 0;
+
+            if (SUCCEEDED(
+                    audioClient->GetBufferSize(&actualBufferFrames)) &&
+                format->nSamplesPerSec > 0) {
+                std::wcout
+                    << L"Actual capture buffer: "
+                    << actualBufferFrames
+                    << L" frames ("
+                    << (actualBufferFrames * 1000ULL) /
+                           format->nSamplesPerSec
+                    << L" ms)\n";
+            }
+
+            hr = audioClient->GetService(
+                __uuidof(IAudioCaptureClient),
+                reinterpret_cast<void**>(&captureClient));
+
+            if (FAILED(hr)) {
+                PrintHr(
+                    L"IAudioClient::GetService(IAudioCaptureClient)", hr);
+                return false;
+            }
+
+            std::wcout
+                << L"Output format: "
+                << format->nSamplesPerSec
+                << L" Hz, s16le\n";
+
+            for (const auto& destination : destinations) {
+                const wchar_t* modeName =
+                    destination->channelMode == ChannelMode::Left
+                        ? L"left"
+                        : (destination->channelMode == ChannelMode::Right
+                               ? L"right"
+                               : L"stereo");
+
+                std::wcout
+                    << L"Destination "
+                    << (destination->index + 1)
+                    << L": "
+                    << modeName
+                    << L", "
+                    << destination->outChannels
+                    << L" ch -> "
+                    << BuildAudioUrl(
+                           destination->url,
+                           format->nSamplesPerSec,
+                           static_cast<WORD>(destination->outChannels))
+                    << L"\n";
+            }
+
+            return true;
+        };
+
+        if (!openCapture()) {
+            stopThreads();
+            return false;
         }
 
         std::wcout
@@ -1807,6 +1843,23 @@ int wmain(int argc, wchar_t* argv[])
             }
 
             return block;
+        };
+
+        // Initialize() 只是准备好流，必须 Start() 之后 loopback 才开始产生数据，
+        // 事件也才会被触发。少了这一步，采集线程永远等不到事件，
+        // 发送队列一直是 0 字节，日志表现为 sent 0 ms / 0% of realtime。
+        const auto startAudioCapture = [&]() -> bool {
+            if (!audioClient)
+                return false;
+
+            ResetEvent(audioCaptureEvent);
+            hr = audioClient->Start();
+            if (FAILED(hr)) {
+                PrintHr(L"IAudioClient::Start(loopback)", hr);
+                return false;
+            }
+
+            return true;
         };
 
         // 采集线程：一次 loopback 采集，按路复制到各自的发送队列。
@@ -2511,14 +2564,77 @@ int wmain(int argc, wchar_t* argv[])
             closeHttp();
         };
 
+        // 每路一个发送线程，独立 HTTP 连接、重连计数、队列和写入统计。
+        const auto startSenderThreads = [&]() {
+            senderThreads.reserve(destinations.size());
+            for (const auto& destination : destinations) {
+                Destination* destinationPtr = destination.get();
+                senderThreads.emplace_back(
+                    [&runSender, destinationPtr]() {
+                        runSender(*destinationPtr);
+                    });
+            }
+        };
+
+        // 按回车：整套重来一遍。
+        // 停采集线程和所有发送线程 -> 重新读取当前默认输出设备并重建 loopback
+        // -> 重新 Start -> 所有目标重新连接。
+        // 这样在系统里切换了默认播放设备之后，按一下回车就能跟上，
+        // 不必重启程序。
+        const auto rebuildAll = [&]() {
+            captureStop.store(true);
+            if (captureThread.joinable())
+                captureThread.join();
+
+            for (const auto& destination : destinations)
+                destination->stop.store(true);
+            for (auto& thread : senderThreads) {
+                if (thread.joinable())
+                    thread.join();
+            }
+            senderThreads.clear();
+
+            if (audioClient)
+                audioClient->Stop();
+
+            // 换设备后时间戳基准会变，旧的校准偏移不能再用。
+            qpcOffsetValid.store(false, std::memory_order_release);
+            qpcOffset100ns.store(0.0, std::memory_order_relaxed);
+            captureFault.store(false);
+
+            for (;;) {
+                if (g_stop.load())
+                    return;
+
+                if (openCapture() && startAudioCapture())
+                    break;
+
+                std::wcerr
+                    << L"Failed to rebuild audio capture; retrying in 1 second.\n";
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            for (const auto& destination : destinations) {
+                destination->stop.store(false);
+                destination->reconnectRequested.store(false);
+                destination->captureDropActive = false;
+                destination->queueTrimActive = false;
+                clearSendQueue(*destination);
+            }
+
+            startSenderThreads();
+            startCaptureThread();
+
+            std::wcout
+                << L"Reconnect requested for all destinations.\n";
+        };
+
         // 先启动发送线程，再启动采集；避免刚启动时队列短暂无人消费。
-        senderThreads.reserve(destinations.size());
-        for (const auto& destination : destinations) {
-            Destination* destinationPtr = destination.get();
-            senderThreads.emplace_back(
-                [&runSender, destinationPtr]() {
-                    runSender(*destinationPtr);
-                });
+        startSenderThreads();
+
+        if (!startAudioCapture()) {
+            stopThreads();
+            return false;
         }
 
         startCaptureThread();
@@ -2529,10 +2645,7 @@ int wmain(int argc, wchar_t* argv[])
         bool captureFailed = false;
 
         while (!g_stop.load()) {
-            if (g_reconnectRequested.exchange(false)) {
-                for (const auto& destination : destinations)
-                    destination->reconnectRequested.store(true);
-            }
+            bool rebuild = g_reconnectRequested.exchange(false);
 
             if (_kbhit()) {
                 const int key = _getch();
@@ -2547,11 +2660,14 @@ int wmain(int argc, wchar_t* argv[])
                         ++g_volumeDownRequests;
                     }
                 } else if (key == '\r') {
-                    std::wcout
-                        << L"Reconnect requested for all destinations.\n";
-                    for (const auto& destination : destinations)
-                        destination->reconnectRequested.store(true);
+                    rebuild = true;
                 }
+            }
+
+            if (rebuild) {
+                std::wcout
+                    << L"Recreating audio capture and reconnecting all destinations.\n";
+                rebuildAll();
             }
 
             if (captureFault.load()) {
