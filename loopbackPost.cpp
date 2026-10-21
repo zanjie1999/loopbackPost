@@ -94,6 +94,13 @@ static constexpr auto kCongestionReconnectDelay = std::chrono::milliseconds(200)
 // 所以最多等这么久就先开采集。
 static constexpr auto kCaptureGateTimeout = std::chrono::milliseconds(3000);
 
+// 全部连上后再静置一小会儿才开采集。
+// HTTP 握手完成不代表服务端那边已经准备好了 aplay：它还要起进程、开设备、
+// 建缓冲。这段时间里推过去的数据会被它按自己的节奏吞掉，各设备就吃进
+// 不同长度的“启动期缓冲”，播放起点也跟着错开。
+// 等它们都稳定下来再统一开始推流，各设备的起点才一致。
+static constexpr auto kCaptureSettleDelay = std::chrono::milliseconds(100);
+
 
 // 队列里的一段 PCM（已转换成 s16le），带它在系统时钟上的位置。
 //
@@ -2651,6 +2658,14 @@ int wmain(int argc, wchar_t* argv[])
             // 采集还没 Start，各路队列里不会有数据；
             // 发送线程连上后只会空转，不会把音频提前灌进去。
             waitForAllDestinationsConnected();
+
+            if (g_stop.load())
+                return false;
+
+            // 再给服务端一点时间把 aplay 真正拉起来，
+            // 免得各设备把“启动期缓冲”吃成不同的初始偏移。
+            // 这段静置发生在 Start() 之前，期间不会推送任何音频。
+            std::this_thread::sleep_for(kCaptureSettleDelay);
 
             if (g_stop.load())
                 return false;
