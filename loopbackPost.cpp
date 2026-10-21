@@ -19,9 +19,11 @@
 #include <deque>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "ole32.lib")
@@ -45,12 +47,14 @@ static bool g_volumeMutePressed = false;
 // 单次写入超过 1 ms，计入写入耗时回退估算。
 static constexpr double kBlockedWriteMs = 1.0;
 
-// 本次连接内累计超过阈值的写入耗时，仅在 WASAPI 时间戳不可用时补偿。
-static double g_blockedMs = 0.0;
-static uint64_t g_writeCalls = 0;
-static uint64_t g_writeOver1MsCalls = 0;
-static double g_writeMaxMs = 0.0;
-static DWORD g_lastWinHttpError = ERROR_SUCCESS;
+// 每个发送线程独立的写入统计。多路发送后不能再共用全局变量。
+struct WriteStats {
+    double blockedMs = 0.0;
+    uint64_t writeCalls = 0;
+    uint64_t writeOver1MsCalls = 0;
+    double writeMaxMs = 0.0;
+    DWORD lastWinHttpError = ERROR_SUCCESS;
+};
 
 // 允许的最大音频年龄（毫秒）。用 WASAPI 时间戳算出的“这段音频现在有多旧”，
 // 超过就从这段音频开头丢弃，只发最新的部分，保证下位机收到的一定是新的。
@@ -102,14 +106,6 @@ struct PcmQueue {
     std::deque<PcmBlock> blocks;
     size_t queuedBytes = 0;
 };
-
-static void ResetWriteStats()
-{
-    g_blockedMs = 0.0;
-    g_writeCalls = 0;
-    g_writeOver1MsCalls = 0;
-    g_writeMaxMs = 0.0;
-}
 
 static void PrintHr(const wchar_t* where, HRESULT hr);
 
@@ -440,6 +436,144 @@ struct UrlParts {
     bool https = false;
     bool portSpecified = false;
 };
+
+// 一路目标：普通立体声，或只发送左/右声道。
+enum class ChannelMode {
+    Stereo,
+    Left,
+    Right
+};
+
+struct DestinationSpec {
+    std::wstring url;
+    ChannelMode channelMode = ChannelMode::Stereo;
+};
+
+// 每路目标独立的发送队列、连接状态和音量请求地址。
+// 采集只做一次，数据按路复制；每路由自己的线程负责 HTTP 发送和重连。
+struct Destination {
+    std::wstring url;
+    ChannelMode channelMode = ChannelMode::Stereo;
+    size_t index = 0;
+
+    PcmQueue queue;
+
+    std::mutex partsMutex;
+    UrlParts activeParts;
+
+    std::atomic_bool stop{false};
+    std::atomic_bool reconnectRequested{false};
+
+    // 仅采集线程访问的日志状态，每路独立，避免互相影响。
+    bool captureDropActive = false;
+    bool queueTrimActive = false;
+
+    // 由 ConfigureDestination 按采集格式和本路输出声道数预先算好。
+    UINT32 outChannels = 0;
+    size_t sendBytesPerFrame = 0;
+    size_t sendChunkBytes = 0;
+    double sendBytesPerMs = 0.0;
+    size_t maxQueuedBytes = 0;
+    size_t minSendBytes = 0;
+};
+
+static void ConfigureDestination(Destination& destination,
+                                 DWORD sampleRate,
+                                 WORD sourceChannels)
+{
+    const UINT32 outChannels =
+        destination.channelMode == ChannelMode::Stereo
+            ? sourceChannels
+            : 1;
+
+    destination.outChannels = outChannels;
+    destination.sendBytesPerFrame =
+        static_cast<size_t>(outChannels) * sizeof(int16_t);
+    destination.sendChunkBytes = std::max<size_t>(
+        1,
+        static_cast<size_t>(
+            static_cast<double>(sampleRate) * kSendChunkMs / 1000.0) *
+            destination.sendBytesPerFrame);
+    destination.sendBytesPerMs =
+        static_cast<double>(sampleRate) *
+        static_cast<double>(destination.sendBytesPerFrame) / 1000.0;
+    destination.maxQueuedBytes = std::max<size_t>(
+        destination.sendChunkBytes * 8,
+        static_cast<size_t>(
+            destination.sendBytesPerMs * kDropAllBacklogMs));
+    destination.minSendBytes = std::max<size_t>(
+        1,
+        static_cast<size_t>(
+            destination.sendBytesPerMs * kSendWaterMs));
+}
+
+static std::wstring TrimSpec(const std::wstring& text)
+{
+    const size_t begin = text.find_first_not_of(L" \t\r\n");
+    if (begin == std::wstring::npos)
+        return L"";
+
+    const size_t end = text.find_last_not_of(L" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+// 解析单个目标：可选的 L/R 前缀 + URL。
+// 前缀只认大写 L/R，避免把 localhost 之类的地址误当成 R 声道。
+static bool ParseDestinationSpec(const std::wstring& text,
+                                 DestinationSpec& spec)
+{
+    std::wstring token = TrimSpec(text);
+    if (token.empty())
+        return false;
+
+    spec.channelMode = ChannelMode::Stereo;
+
+    // 只有前缀没有地址，视为无效项。
+    if (token == L"L" || token == L"R")
+        return false;
+
+    if (token.size() >= 2 && token[0] == L'L') {
+        spec.channelMode = ChannelMode::Left;
+        token.erase(0, 1);
+    } else if (token.size() >= 2 && token[0] == L'R') {
+        spec.channelMode = ChannelMode::Right;
+        token.erase(0, 1);
+    }
+
+    token = TrimSpec(token);
+    if (token.empty())
+        return false;
+
+    spec.url = token;
+    return true;
+}
+
+// 第一个参数用半角逗号分割多个目标，空项自动忽略。
+static std::vector<DestinationSpec> ParseDestinationSpecs(
+    const std::wstring& input)
+{
+    std::vector<DestinationSpec> specs;
+    size_t start = 0;
+
+    while (start <= input.size()) {
+        size_t comma = input.find(L',', start);
+        if (comma == std::wstring::npos)
+            comma = input.size();
+
+        DestinationSpec spec;
+        if (ParseDestinationSpec(
+                input.substr(start, comma - start), spec)) {
+            specs.push_back(std::move(spec));
+        }
+
+        if (comma == input.size())
+            break;
+
+        start = comma + 1;
+    }
+
+    return specs;
+}
 
 static bool HasExplicitPort(const std::wstring& url) {
     const size_t schemeEnd = url.find(L"://");
@@ -785,36 +919,34 @@ static bool SendVolumeRequest(const UrlParts& source,
     return ok;
 }
 
-static void HandlePendingVolumeRequests(const UrlParts& parts)
+static void HandlePendingVolumeRequests(
+    const std::vector<std::unique_ptr<Destination>>& destinations)
 {
     const unsigned int upRequests = g_volumeUpRequests.exchange(0);
     const unsigned int downRequests = g_volumeDownRequests.exchange(0);
 
-    for (unsigned int i = 0; i < upRequests; ++i) {
-        if (SendVolumeRequest(parts, L"/volp"))
-            std::wcout << L"Volume up.\n";
-    }
+    if (upRequests == 0 && downRequests == 0)
+        return;
 
-    for (unsigned int i = 0; i < downRequests; ++i) {
-        if (SendVolumeRequest(parts, L"/volm"))
-            std::wcout << L"Volume down.\n";
-    }
-}
+    // 音量键对所有目标广播；每一路使用自己当前生效的地址。
+    for (const auto& destinationPtr : destinations) {
+        Destination& destination = *destinationPtr;
 
-static void SleepWhileHandlingVolumeRequests(
-    std::chrono::milliseconds duration,
-    const UrlParts& parts)
-{
-    const auto end = std::chrono::steady_clock::now() + duration;
+        UrlParts parts;
+        {
+            std::lock_guard<std::mutex> lock(destination.partsMutex);
+            parts = destination.activeParts;
+        }
 
-    while (!g_stop.load()) {
-        HandlePendingVolumeRequests(parts);
+        for (unsigned int i = 0; i < upRequests; ++i) {
+            if (SendVolumeRequest(parts, L"/volp"))
+                std::wcout << L"Volume up.\n";
+        }
 
-        const auto remaining = end - std::chrono::steady_clock::now();
-        if (remaining <= std::chrono::steady_clock::duration::zero())
-            break;
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        for (unsigned int i = 0; i < downRequests; ++i) {
+            if (SendVolumeRequest(parts, L"/volm"))
+                std::wcout << L"Volume down.\n";
+        }
     }
 }
 
@@ -909,7 +1041,8 @@ static void PrintHttpResponse(DWORD status,
 
 static bool WriteRaw(HINTERNET request,
                      const BYTE* data,
-                     DWORD bytes)
+                     DWORD bytes,
+                     WriteStats& stats)
 {
     while (bytes > 0) {
         DWORD written = 0;
@@ -921,8 +1054,8 @@ static bool WriteRaw(HINTERNET request,
                 data,
                 bytes,
                 &written)) {
-            g_lastWinHttpError = GetLastError();
-            PrintWinError(L"WinHttpWriteData", g_lastWinHttpError);
+            stats.lastWinHttpError = GetLastError();
+            PrintWinError(L"WinHttpWriteData", stats.lastWinHttpError);
             return false;
         }
 
@@ -930,15 +1063,15 @@ static bool WriteRaw(HINTERNET request,
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - writeStart).count();
 
-        ++g_writeCalls;
+        ++stats.writeCalls;
         if (writeMs >= 1.0)
-            ++g_writeOver1MsCalls;
-        g_writeMaxMs = std::max(g_writeMaxMs, writeMs);
+            ++stats.writeOver1MsCalls;
+        stats.writeMaxMs = std::max(stats.writeMaxMs, writeMs);
 
         if (writeMs > kBlockedWriteMs)
-            g_blockedMs += writeMs;
+            stats.blockedMs += writeMs;
 
-        g_lastWinHttpError = ERROR_SUCCESS;
+        stats.lastWinHttpError = ERROR_SUCCESS;
 
         if (written == 0) {
             std::wcerr
@@ -955,9 +1088,10 @@ static bool WriteRaw(HINTERNET request,
 
 static bool WritePcm(HINTERNET request,
                      const BYTE* data,
-                     DWORD bytes)
+                     DWORD bytes,
+                     WriteStats& stats)
 {
-    return WriteRaw(request, data, bytes);
+    return WriteRaw(request, data, bytes, stats);
 }
 
 static int16_t FloatToS16(float value)
@@ -1174,19 +1308,19 @@ int wmain(int argc, wchar_t* argv[])
     if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
         PrintWinError(L"SetPriorityClass(HIGH_PRIORITY_CLASS)");
 
-    std::wstring url;
+    std::wstring input;
 
     if (argc >= 2) {
-        url = argv[1];
+        input = argv[1];
     } else {
         std::wcout
             << L"workdayAlarmClockGo URL end with /aplay: ";
 
-        std::getline(std::wcin, url);
+        std::getline(std::wcin, input);
     }
 
     // 命令行参数：
-    //   argv[1] 目标地址
+    //   argv[1] 目标地址，可用半角逗号分隔多个；L/R 前缀表示只发左/右声道
     //   argv[2] 发送水位 ms（多攒这么多音频才发，等于额外增加延迟）
     //   argv[3] 允许的最大音频年龄 ms，超过就丢旧音频
     //   argv[4] 队列硬上限 ms（兜底，正常不该触发）
@@ -1205,15 +1339,25 @@ int wmain(int argc, wchar_t* argv[])
         kDropAllBacklogMs = std::wcstod(argv[4], nullptr);
     }
 
-    if (url.empty()) {
+    if (input.empty()) {
         std::wcerr << L"No URL.\n";
         return 1;
     }
 
-    UrlParts parts;
+    const std::vector<DestinationSpec> specs =
+        ParseDestinationSpecs(input);
 
-    if (!CrackUrl(url, parts))
+    if (specs.empty()) {
+        std::wcerr << L"No valid URL.\n";
         return 1;
+    }
+
+    // 先验证每个地址，避免线程启动后才发现 URL 写错。
+    for (const DestinationSpec& spec : specs) {
+        UrlParts parts;
+        if (!CrackUrl(spec.url, parts))
+            return 1;
+    }
 
     if (!SetConsoleCtrlHandler(
             ConsoleHandler,
@@ -1230,10 +1374,6 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
-    HINTERNET session = nullptr;
-    HINTERNET connect = nullptr;
-    HINTERNET request = nullptr;
-
     IMMDeviceEnumerator* enumerator = nullptr;
     IMMDevice* device = nullptr;
     IAudioClient* audioClient = nullptr;
@@ -1249,8 +1389,41 @@ int wmain(int argc, wchar_t* argv[])
 
     bool ok = false;
     bool keyboardHookStarted = false;
+    const bool serviceMode = (argc >= 2);
 
-    do {
+    const auto run = [&]() -> bool {
+        std::vector<std::unique_ptr<Destination>> destinations;
+        std::thread captureThread;
+        std::thread volumeThread;
+        std::vector<std::thread> senderThreads;
+
+        std::atomic_bool captureStop{false};
+        std::atomic_bool captureFault{false};
+        std::atomic_bool volumeThreadStop{false};
+        std::atomic_bool qpcOffsetValid{false};
+        std::atomic<double> qpcOffset100ns{0.0};
+
+        LARGE_INTEGER qpcFrequency{};
+
+        const auto stopThreads = [&]() {
+            // 先通知所有线程退出，再逐个 join，避免串行等待。
+            volumeThreadStop.store(true);
+            captureStop.store(true);
+            for (auto& destination : destinations)
+                destination->stop.store(true);
+
+            if (volumeThread.joinable())
+                volumeThread.join();
+            if (captureThread.joinable())
+                captureThread.join();
+            for (auto& thread : senderThreads) {
+                if (thread.joinable())
+                    thread.join();
+            }
+            senderThreads.clear();
+        };
+
+        // 初始化默认输出设备的 loopback 采集。
         hr = CoCreateInstance(
             __uuidof(MMDeviceEnumerator),
             nullptr,
@@ -1259,10 +1432,9 @@ int wmain(int argc, wchar_t* argv[])
             reinterpret_cast<void**>(&enumerator));
 
         if (FAILED(hr)) {
-            PrintHr(
-                L"CoCreateInstance(MMDeviceEnumerator)",
-                hr);
-            break;
+            PrintHr(L"CoCreateInstance(MMDeviceEnumerator)", hr);
+            stopThreads();
+            return false;
         }
 
         hr = enumerator->GetDefaultAudioEndpoint(
@@ -1271,10 +1443,9 @@ int wmain(int argc, wchar_t* argv[])
             &device);
 
         if (FAILED(hr)) {
-            PrintHr(
-                L"GetDefaultAudioEndpoint",
-                hr);
-            break;
+            PrintHr(L"GetDefaultAudioEndpoint", hr);
+            stopThreads();
+            return false;
         }
 
         hr = device->Activate(
@@ -1284,43 +1455,26 @@ int wmain(int argc, wchar_t* argv[])
             reinterpret_cast<void**>(&audioClient));
 
         if (FAILED(hr)) {
-            PrintHr(
-                L"IMMDevice::Activate(IAudioClient)",
-                hr);
-            break;
+            PrintHr(L"IMMDevice::Activate(IAudioClient)", hr);
+            stopThreads();
+            return false;
         }
 
         hr = audioClient->GetMixFormat(&format);
 
         if (FAILED(hr)) {
-            PrintHr(
-                L"IAudioClient::GetMixFormat",
-                hr);
-            break;
+            PrintHr(L"IAudioClient::GetMixFormat", hr);
+            stopThreads();
+            return false;
         }
 
-        // 保存当前默认输出设备的 ID。每次重连都会重新查询默认输出，
-        // 如果设备发生变化，就重新建立 loopback capture。
-        std::wstring deviceId;
-        {
-            LPWSTR rawId = nullptr;
-            hr = device->GetId(&rawId);
-            if (FAILED(hr)) {
-                PrintHr(L"IMMDevice::GetId", hr);
-                break;
-            }
-            if (rawId) {
-                deviceId = rawId;
-                CoTaskMemFree(rawId);
-            }
-        }
-
-        SampleType sampleType = GetSampleType(format);
+        const SampleType sampleType = GetSampleType(format);
 
         if (sampleType == SampleType::UNSUPPORTED) {
             std::wcerr
                 << L"Unsupported WASAPI sample format.\n";
-            break;
+            stopThreads();
+            return false;
         }
 
         std::wcout
@@ -1345,286 +1499,27 @@ int wmain(int argc, wchar_t* argv[])
             << SampleTypeName(sampleType)
             << L"\n";
 
-        std::wstring finalUrl =
-            BuildAudioUrl(
-                url,
+        // 建立每一路目标。Destination 内含 mutex，用 unique_ptr 保证地址稳定。
+        destinations.reserve(specs.size());
+        for (size_t i = 0; i < specs.size(); ++i) {
+            auto destination = std::make_unique<Destination>();
+            destination->url = specs[i].url;
+            destination->channelMode = specs[i].channelMode;
+            destination->index = i;
+            ConfigureDestination(
+                *destination,
                 format->nSamplesPerSec,
                 format->nChannels);
-
-        if (finalUrl.empty())
-            break;
-
-        UrlParts finalParts;
-
-        if (!CrackUrl(finalUrl, finalParts))
-            break;
-
-        // 当前实际使用的地址。302 时优先使用 Location；如果服务端只做 8080 -> 8880，
-        // 也会自动切换到 8880。
-        UrlParts activeParts = finalParts;
-        bool hasStreamedSuccessfully = false;
-
-        if (!StartKeyboardHook())
-            break;
-        keyboardHookStarted = true;
-
-        std::wcout
-            << L"Output format: "
-            << format->nSamplesPerSec
-            << L" Hz, "
-            << format->nChannels
-            << L" ch, s16le\n";
-
-        std::wcout
-            << L"Streaming PCM to: "
-            << finalUrl
-            << L"\n";
-
-        std::wcout
-            << L"Send watermark: " << kSendWaterMs
-            << L" ms (extra latency), drop above "
-            << std::max(kDropBacklogMs, kSendWaterMs + 10.0)
-            << L" ms\n";
-
-        const auto closeHttp = [&]() {
-            if (request) { WinHttpCloseHandle(request); request = nullptr; }
-            if (connect) { WinHttpCloseHandle(connect); connect = nullptr; }
-            if (session) { WinHttpCloseHandle(session); session = nullptr; }
-        };
-
-        const auto openHttp = [&]() -> bool {
-            for (;;) {
-                closeHttp();
-                DWORD failureError = ERROR_SUCCESS;
-
-                session = WinHttpOpen(
-                    L"workdayAlarmClockGo/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
-                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-                if (!session) {
-                    failureError = GetLastError();
-                    PrintWinError(L"WinHttpOpen", failureError);
-                } else {
-                    // 设置超时：Resolve、Connect、Send、Receive
-                    WinHttpSetTimeouts(session, 5000, 5000, 5000, 5000);
-                    connect = WinHttpConnect(
-                        session,
-                        activeParts.host.c_str(),
-                        activeParts.port,
-                        0);
-                    if (!connect) {
-                        failureError = GetLastError();
-                        PrintWinError(L"WinHttpConnect", failureError);
-                    } else {
-                        request = WinHttpOpenRequest(
-                            connect, L"PUT", activeParts.path.c_str(), nullptr,
-                            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                            finalParts.https ? WINHTTP_FLAG_SECURE : 0);
-                        if (!request) {
-                            failureError = GetLastError();
-                            PrintWinError(L"WinHttpOpenRequest", failureError);
-                        } else {
-                            const wchar_t headers[] =
-                                L"Content-Type: application/octet-stream\r\n"
-                                L"Content-Length: 68719476735\r\n"
-                                L"Expect: 100-continue\r\n";
-                            if (WinHttpSendRequest(
-                                    request, headers, static_cast<DWORD>(-1),
-                                    WINHTTP_NO_REQUEST_DATA, 0,
-                                    WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH, 0)) {
-                                return true;
-                            }
-                            failureError = GetLastError();
-                            PrintWinError(L"WinHttpSendRequest", failureError);
-                        }
-                    }
-                }
-                closeHttp();
-                if (!hasStreamedSuccessfully &&
-                    IsConnectionFailure(failureError) &&
-                    AdvancePortFallback(activeParts)) {
-                    std::wcout
-                        << L"Cannot connect; trying port "
-                        << activeParts.port << L".\n";
-                    continue;
-                }
-                return false;
-            }
-        };
-
-        // 重连时只 Stop + Reset，不要在这里 Start。
-        // 这样在等待网络/服务端恢复的这段时间里，WASAPI 不会继续产生
-        // 捕获数据，避免 200 ms（或普通重连等待期间）产生新的积压。
-        const auto stopAndFlushAudioCapture = [&]() -> bool {
-            if (!audioClient)
-                return false;
-
-            hr = audioClient->Stop();
-            if (FAILED(hr)) {
-                PrintHr(L"IAudioClient::Stop(reconnect)", hr);
-                return false;
-            }
-
-            hr = audioClient->Reset();
-            if (FAILED(hr)) {
-                PrintHr(L"IAudioClient::Reset(reconnect)", hr);
-                return false;
-            }
-            ResetEvent(audioCaptureEvent);
-
-            return true;
-        };
-
-        const auto startAudioCapture = [&]() -> bool {
-            if (!audioClient)
-                return false;
-
-            ResetEvent(audioCaptureEvent);
-            hr = audioClient->Start();
-            if (FAILED(hr)) {
-                PrintHr(L"IAudioClient::Start(reconnect)", hr);
-                return false;
-            }
-
-            return true;
-        };
-
-        // 每次真正重连前重新读取默认输出设备。
-        // 当前设备没变：保持已经 Stop+Reset 的状态，不再次启动。
-        // 设备变了：完整释放旧 endpoint，并建立新的 loopback，但仍不 Start，
-        // 等 HTTP 连接成功后再统一启动，这样重连等待期间绝不会积累音频。
-        const auto refreshAudioDevice = [&]() -> bool {
-            IMMDevice* currentDevice = nullptr;
-
-            hr = enumerator->GetDefaultAudioEndpoint(
-                eRender,
-                eMultimedia,
-                &currentDevice);
-
-            if (FAILED(hr)) {
-                PrintHr(L"GetDefaultAudioEndpoint(reconnect)", hr);
-                return false;
-            }
-
-            LPWSTR rawId = nullptr;
-            hr = currentDevice->GetId(&rawId);
-            if (FAILED(hr)) {
-                PrintHr(L"IMMDevice::GetId(reconnect)", hr);
-                currentDevice->Release();
-                return false;
-            }
-
-            std::wstring currentId = rawId ? rawId : L"";
-            if (rawId)
-                CoTaskMemFree(rawId);
-
-            if (currentId == deviceId) {
-                currentDevice->Release();
-                return true;
-            }
-
-            std::wcout
-                << L"Default audio output changed; switching capture device.\n";
-
-            if (audioClient) {
-                // 正常情况下这里应该已经 Stop；失败也不影响后面释放重建。
-                audioClient->Stop();
-            }
-
-            if (captureClient) {
-                captureClient->Release();
-                captureClient = nullptr;
-            }
-
-            if (audioClient) {
-                audioClient->Release();
-                audioClient = nullptr;
-            }
-
-            if (device) {
-                device->Release();
-                device = nullptr;
-            }
-
-            if (format) {
-                CoTaskMemFree(format);
-                format = nullptr;
-            }
-
-            device = currentDevice;
-            currentDevice = nullptr;
-            deviceId = currentId;
-
-            hr = device->Activate(
-                __uuidof(IAudioClient),
-                CLSCTX_ALL,
-                nullptr,
-                reinterpret_cast<void**>(&audioClient));
-
-            if (FAILED(hr)) {
-                PrintHr(L"IMMDevice::Activate(IAudioClient,reconnect)", hr);
-                return false;
-            }
-
-            hr = audioClient->GetMixFormat(&format);
-            if (FAILED(hr)) {
-                PrintHr(L"IAudioClient::GetMixFormat(reconnect)", hr);
-                return false;
-            }
-
-            sampleType = GetSampleType(format);
-            if (sampleType == SampleType::UNSUPPORTED) {
-                std::wcerr
-                    << L"Unsupported WASAPI sample format after device switch.\n";
-                return false;
-            }
-
-            finalUrl = BuildAudioUrl(
-                url,
-                format->nSamplesPerSec,
-                format->nChannels);
-
-            if (finalUrl.empty() || !CrackUrl(finalUrl, finalParts))
-                return false;
-
-            if (!InitializeLowLatencyLoopback(
-                    device, &audioClient, format, audioCaptureEvent)) {
-                return false;
-            }
-
-            UINT32 actualBufferFrames = 0;
-            if (SUCCEEDED(audioClient->GetBufferSize(&actualBufferFrames)) &&
-                format->nSamplesPerSec > 0) {
-                std::wcout
-                    << L"Actual capture buffer: "
-                    << actualBufferFrames
-                    << L" frames ("
-                    << (actualBufferFrames * 1000ULL) /
-                           format->nSamplesPerSec
-                    << L" ms)\n";
-            }
-
-            hr = audioClient->GetService(
-                __uuidof(IAudioCaptureClient),
-                reinterpret_cast<void**>(&captureClient));
-
-            if (FAILED(hr)) {
-                PrintHr(
-                    L"IAudioClient::GetService(IAudioCaptureClient,reconnect)",
-                    hr);
-                return false;
-            }
-
-            // 注意：这里故意不 Start。等 HTTP 真正连接成功后，由主循环统一 Start。
-            return true;
-        };
+            destinations.push_back(std::move(destination));
+        }
 
         if (!InitializeLowLatencyLoopback(
                 device, &audioClient, format, audioCaptureEvent)) {
-            break;
+            stopThreads();
+            return false;
         }
 
-        // 共享模式下申请值不一定被采纳，把真实缓冲大小打出来，
-        // 这样才能知道这一项到底省下了多少延迟
+        // 共享模式下申请值不一定被采纳，把真实缓冲大小打出来。
         UINT32 actualBufferFrames = 0;
 
         if (SUCCEEDED(audioClient->GetBufferSize(&actualBufferFrames)) &&
@@ -1643,101 +1538,70 @@ int wmain(int argc, wchar_t* argv[])
             reinterpret_cast<void**>(&captureClient));
 
         if (FAILED(hr)) {
-            PrintHr(
-                L"IAudioClient::GetService(IAudioCaptureClient)",
-                hr);
-            break;
+            PrintHr(L"IAudioClient::GetService(IAudioCaptureClient)", hr);
+            stopThreads();
+            return false;
         }
 
-        // 不在这里启动采集。
-        // 首次 HTTP 连接成功后，由主循环统一 Start；这样启动阶段也不会
-        // 在网络还没建立时产生无法发送的 WASAPI 积压。
-        std::wcout
-            << L"Press Enter to reconnect, Ctrl+C to stop.\n";
-
-        const bool serviceMode = (argc >= 2);
-
-        bool connected = false;
-        bool streamConfirmed = false; // 已持续成功写出多块音频数据
-        int successfulChunks = 0;
-        int autoReconnectAttempts = 0;
-        bool retryAfterDelay = false; // 普通断线：等 1 秒再重连
-        bool serviceRetryDelay = false; // 开机启动模式：3 次失败后等 10 秒
-        bool shortReconnectDelay = false; // 手动重连：等待 200 ms
-        LARGE_INTEGER qpcFrequency{};
         if (!QueryPerformanceFrequency(&qpcFrequency) ||
             qpcFrequency.QuadPart <= 0) {
             PrintWinError(L"QueryPerformanceFrequency");
-            ok = false;
-            break;
+            stopThreads();
+            return false;
         }
-        ok = true;
 
-        // 一次最多写出多少字节（s16le）。
-        //
-        // 发送不再按固定节拍，而是“有数据就发”，由采集线程的数据到达驱动。
-        // 采集线程本来就是被 WASAPI 事件唤醒的，事件频率就是音频产生的频率，
-        // 所以发送速率天然等于实时速率，不会像定时器那样累积误差。
-        // 这里只是单次写出的上限，避免一次写太多导致长阻塞。
-        const size_t sendBytesPerFrame =
-            static_cast<size_t>(format->nChannels) * sizeof(int16_t);
-        const size_t sendChunkBytes = std::max<size_t>(
-            1,
-            static_cast<size_t>(
-                static_cast<double>(format->nSamplesPerSec) *
-                kSendChunkMs / 1000.0) *
-                sendBytesPerFrame);
-        const double sendBytesPerMs =
-            static_cast<double>(format->nSamplesPerSec) *
-            static_cast<double>(sendBytesPerFrame) / 1000.0;
+        std::wcout
+            << L"Output format: "
+            << format->nSamplesPerSec
+            << L" Hz, s16le\n";
 
-        // 队列硬上限：只用来兜住病态情况（比如服务端卡死），不参与日常调节。
-        // 日常的延迟控制由 enqueuePcm 按 WASAPI 时间戳负责。
-        const size_t maxQueuedBytes = std::max<size_t>(
-            sendChunkBytes * 8,
-            static_cast<size_t>(sendBytesPerMs * kDropAllBacklogMs));
+        for (const auto& destination : destinations) {
+            const wchar_t* modeName =
+                destination->channelMode == ChannelMode::Left
+                    ? L"left"
+                    : (destination->channelMode == ChannelMode::Right
+                           ? L"right"
+                           : L"stereo");
 
-        // 发送水位：队列里攒够这么多字节才写出去。
-        // 这就是 argv[2] 控制的“额外延迟”——攒得越多，越能吸收网络抖动，
-        // 但端到端延迟也越大。
-        const size_t minSendBytes = std::max<size_t>(
-            1, static_cast<size_t>(sendBytesPerMs * kSendWaterMs));
+            std::wcout
+                << L"Destination "
+                << (destination->index + 1)
+                << L": "
+                << modeName
+                << L", "
+                << destination->outChannels
+                << L" ch -> "
+                << BuildAudioUrl(
+                       destination->url,
+                       format->nSamplesPerSec,
+                       static_cast<WORD>(destination->outChannels))
+                << L"\n";
+        }
 
-        // 实际的丢弃阈值。
-        // 必须比发送水位大，否则“攒够水位才发”和“超过阈值就丢”会互相打架：
-        // 攒到水位之前音频就已经被判定过旧而丢掉，水位永远攒不满。
-        // 留一个 WASAPI 周期的余量（10ms），保证水位能正常填满。
+        std::wcout
+            << L"Send watermark: " << kSendWaterMs
+            << L" ms (extra latency), drop above "
+            << std::max(kDropBacklogMs, kSendWaterMs + 10.0)
+            << L" ms\n";
+
+        if (!StartKeyboardHook()) {
+            stopThreads();
+            return false;
+        }
+        keyboardHookStarted = true;
+
+        // 音量请求走独立线程：SendVolumeRequest 是同步 HTTP 调用，
+        // 超时 1 秒，跑在发送线程上会把音频卡住最多 1 秒。
+        volumeThread = std::thread([&]() {
+            while (!g_stop.load() && !volumeThreadStop.load()) {
+                HandlePendingVolumeRequests(destinations);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(20));
+            }
+        });
+
         const double effectiveDropMs =
             std::max(kDropBacklogMs, kSendWaterMs + 10.0);
-
-        // 采集与发送之间的队列，以及采集线程。
-        PcmQueue queue;
-        std::thread captureThread;
-        bool captureRunning = false;
-        // captureStop：主线程要求采集线程退出。
-        // captureFault：采集线程自己出错（设备被拔、GetBuffer 失败）。
-        std::atomic_bool captureStop{false};
-        std::atomic_bool captureFault{false};
-
-        // 发送侧诊断：每 5 秒打一次队列深度和实际发送速率。
-        auto lastDiagTime = std::chrono::steady_clock::now();
-        size_t diagSentBytes = 0;
-
-        // 把 PCM 入队。采集线程只做这一步，永远不等网络。
-        //
-        // 关键：用 WASAPI 时间戳判断这段音频“现在有多旧”，太旧就丢掉开头，
-        // 只留最新的部分。这样无论积压来自 WASAPI 缓冲、本进程队列，
-        // 还是已经堵在链路里的数据，都被同一把绝对时间的尺子量到，
-        // 保证发出去的音频一定是新鲜的。
-        // WASAPI 时间戳与本地 QPC 之间存在固定偏移（loopback 拿到的是已播放
-        // 音频，时间戳标记的是它在设备时间线上的位置）。用第一个包校准一次，
-        // 之后所有 age 计算都减掉这个偏移，让日志里的 age 反映真实延迟。
-        bool qpcOffsetValid = false;
-        double qpcOffset100ns = 0.0;
-
-        // 两个日志状态分开，避免互相覆盖导致日志反复翻转。
-        bool captureDropActive = false;
-        bool queueTrimActive = false;
 
         // 把 WASAPI 时间戳换算成“这段音频现在有多旧”（毫秒）。
         // 返回值已经扣掉校准偏移；偏移尚未建立时返回 0（不丢）。
@@ -1755,16 +1619,22 @@ int wmain(int argc, wchar_t* argv[])
                 static_cast<double>(frames) * 10000000.0 /
                     static_cast<double>(format->nSamplesPerSec);
 
-            // 第一个包用来建立偏移：此时认为这段音频“刚好是实时的”。
-            if (!qpcOffsetValid) {
-                qpcOffset100ns = end100ns - now100ns;
-                qpcOffsetValid = true;
+            if (!qpcOffsetValid.load(std::memory_order_relaxed)) {
+                qpcOffset100ns.store(
+                    end100ns - now100ns,
+                    std::memory_order_relaxed);
+                qpcOffsetValid.store(true, std::memory_order_release);
             }
 
-            return (now100ns + qpcOffset100ns - end100ns) / 10000.0;
+            const double offset =
+                qpcOffset100ns.load(std::memory_order_relaxed);
+            return (now100ns + offset - end100ns) / 10000.0;
         };
 
-        const auto enqueuePcm = [&](const std::vector<int16_t>& pcm,
+        // 把 PCM 入队到某一路。采集线程只做这一步，永远不等网络。
+        // 时间戳判断和丢弃逻辑与原单路版本一致，只是按本路输出声道数换算字节。
+        const auto enqueuePcm = [&](Destination& destination,
+                                    const std::vector<int16_t>& pcm,
                                     UINT64 qpcStart,
                                     UINT32 frames,
                                     bool hasTimestamp) {
@@ -1779,16 +1649,15 @@ int wmain(int argc, wchar_t* argv[])
             if (hasTimestamp && format->nSamplesPerSec > 0) {
                 const double ageMs = computeAgeMs(qpcStart, frames);
                 if (ageMs > effectiveDropMs) {
-                    // 超出阈值多少毫秒，就从这段音频开头丢掉多少。
                     const double excessMs = ageMs - effectiveDropMs;
                     uint64_t dropFrames = static_cast<uint64_t>(
                         std::ceil(excessMs * format->nSamplesPerSec /
                                   1000.0));
 
                     if (dropFrames >= frames) {
-                        // 整段都太旧，直接扔掉。
                         std::wcout
-                            << L"Stale packet (" 
+                            << L"[dest " << (destination.index + 1)
+                            << L"] Stale packet ("
                             << static_cast<long long>(ageMs)
                             << L" ms old); dropped entirely.\n";
                         return;
@@ -1796,7 +1665,7 @@ int wmain(int argc, wchar_t* argv[])
 
                     const size_t dropBytes =
                         static_cast<size_t>(dropFrames) *
-                        static_cast<size_t>(format->nChannels) *
+                        static_cast<size_t>(destination.outChannels) *
                         sizeof(int16_t);
                     bytes += dropBytes;
                     size -= dropBytes;
@@ -1807,35 +1676,34 @@ int wmain(int argc, wchar_t* argv[])
                             static_cast<double>(dropFrames) * 10000000.0 /
                             static_cast<double>(format->nSamplesPerSec));
 
-                    if (!captureDropActive) {
-                        std::wcout << L"Audio " 
-                                   << static_cast<long long>(ageMs)
-                                   << L" ms old; dropped "
-                                   << static_cast<long long>(excessMs)
-                                   << L" ms to catch up.\n";
-                        captureDropActive = true;
+                    if (!destination.captureDropActive) {
+                        std::wcout
+                            << L"[dest " << (destination.index + 1)
+                            << L"] Audio "
+                            << static_cast<long long>(ageMs)
+                            << L" ms old; dropped "
+                            << static_cast<long long>(excessMs)
+                            << L" ms to catch up.\n";
+                        destination.captureDropActive = true;
                     }
-                } else if (captureDropActive) {
-                    std::wcout << L"Audio age back to normal.\n";
-                    captureDropActive = false;
+                } else if (destination.captureDropActive) {
+                    std::wcout
+                        << L"[dest " << (destination.index + 1)
+                        << L"] Audio age back to normal.\n";
+                    destination.captureDropActive = false;
                 }
             }
 
-            // 入队，然后从队头砍掉已经太旧的音频。
-            //
-            // 只检查“新到的这一包”是不够的：写调用阻塞期间，采集线程会继续
-            // 把当时还很新的包塞进队列，它们入队时 age≈0 不触发丢弃，
-            // 但会在队列里越放越旧。而发送速率等于实时速率，永远追不回来。
-            // 所以必须回头检查队列头，把旧的砍掉，保证队列里只剩新鲜音频。
             double staleDroppedMs = 0.0;
             {
-                std::lock_guard<std::mutex> lock(queue.mutex);
+                std::lock_guard<std::mutex> lock(destination.queue.mutex);
 
-                // 硬上限兜底：防止服务端彻底卡死时内存无限增长。
-                while (queue.queuedBytes + size > maxQueuedBytes &&
-                       !queue.blocks.empty()) {
-                    queue.queuedBytes -= queue.blocks.front().data.size();
-                    queue.blocks.pop_front();
+                while (destination.queue.queuedBytes + size >
+                           destination.maxQueuedBytes &&
+                       !destination.queue.blocks.empty()) {
+                    destination.queue.queuedBytes -=
+                        destination.queue.blocks.front().data.size();
+                    destination.queue.blocks.pop_front();
                 }
 
                 PcmBlock block;
@@ -1844,23 +1712,25 @@ int wmain(int argc, wchar_t* argv[])
                 block.frames = keepFrames;
                 block.hasTimestamp = hasTimestamp;
 
-                queue.queuedBytes += size;
-                queue.blocks.push_back(std::move(block));
+                destination.queue.queuedBytes += size;
+                destination.queue.blocks.push_back(std::move(block));
 
-                // 从队头砍掉过旧的块。
-                if (format->nSamplesPerSec > 0 && qpcOffsetValid) {
+                if (format->nSamplesPerSec > 0 &&
+                    qpcOffsetValid.load(std::memory_order_relaxed)) {
                     LARGE_INTEGER nowQpc{};
                     if (QueryPerformanceCounter(&nowQpc)) {
                         const double now100ns =
                             static_cast<double>(nowQpc.QuadPart) *
-                            10000000.0 /
-                            static_cast<double>(qpcFrequency.QuadPart) +
-                            qpcOffset100ns;
+                                10000000.0 /
+                                static_cast<double>(
+                                    qpcFrequency.QuadPart) +
+                            qpcOffset100ns.load(std::memory_order_relaxed);
 
                         size_t staleDropped = 0;
-                        while (!queue.blocks.empty() &&
-                               queue.blocks.front().hasTimestamp) {
-                            const PcmBlock& front = queue.blocks.front();
+                        while (!destination.queue.blocks.empty() &&
+                               destination.queue.blocks.front().hasTimestamp) {
+                            const PcmBlock& front =
+                                destination.queue.blocks.front();
                             const double end100ns =
                                 static_cast<double>(front.qpcStart) +
                                 static_cast<double>(front.frames) *
@@ -1873,81 +1743,80 @@ int wmain(int argc, wchar_t* argv[])
                                 break;
 
                             staleDropped += front.data.size();
-                            queue.queuedBytes -= front.data.size();
-                            queue.blocks.pop_front();
+                            destination.queue.queuedBytes -=
+                                front.data.size();
+                            destination.queue.blocks.pop_front();
                         }
 
-                        if (staleDropped > 0)
+                        if (staleDropped > 0) {
                             staleDroppedMs =
                                 static_cast<double>(staleDropped) /
-                                sendBytesPerMs;
+                                destination.sendBytesPerMs;
+                        }
                     }
                 }
             }
 
             if (staleDroppedMs > 0.0) {
-                if (!queueTrimActive) {
-                    std::wcout << L"Queue backlog; dropped "
-                               << static_cast<long long>(staleDroppedMs)
-                               << L" ms of stale audio.\n";
-                    queueTrimActive = true;
+                if (!destination.queueTrimActive) {
+                    std::wcout
+                        << L"[dest " << (destination.index + 1)
+                        << L"] Queue backlog; dropped "
+                        << static_cast<long long>(staleDroppedMs)
+                        << L" ms of stale audio.\n";
+                    destination.queueTrimActive = true;
                 }
-            } else if (queueTrimActive) {
-                std::wcout << L"Queue is fresh again.\n";
-                queueTrimActive = false;
+            } else if (destination.queueTrimActive) {
+                std::wcout
+                    << L"[dest " << (destination.index + 1)
+                    << L"] Queue is fresh again.\n";
+                destination.queueTrimActive = false;
             }
         };
 
-        const auto clearSendQueue = [&]() {
-            std::lock_guard<std::mutex> lock(queue.mutex);
-            queue.blocks.clear();
-            queue.queuedBytes = 0;
+        const auto clearSendQueue = [&](Destination& destination) {
+            std::lock_guard<std::mutex> lock(destination.queue.mutex);
+            destination.queue.blocks.clear();
+            destination.queue.queuedBytes = 0;
         };
 
-        // 从队头取走当前所有可用数据（最多 sendChunkBytes）。
-        // 没有节拍要凑，取到多少就发多少。
-        const auto takeSendBlock = [&]() {
+        // 从队头取走当前所有可用数据（最多本路的 sendChunkBytes）。
+        const auto takeSendBlock = [&](Destination& destination) {
             std::vector<BYTE> block;
-            std::lock_guard<std::mutex> lock(queue.mutex);
+            std::lock_guard<std::mutex> lock(destination.queue.mutex);
 
             size_t taken = 0;
-            while (taken < sendChunkBytes && !queue.blocks.empty()) {
-                PcmBlock& front = queue.blocks.front();
-                const size_t need = sendChunkBytes - taken;
+            while (taken < destination.sendChunkBytes &&
+                   !destination.queue.blocks.empty()) {
+                PcmBlock& front = destination.queue.blocks.front();
+                const size_t need = destination.sendChunkBytes - taken;
                 if (front.data.size() <= need) {
                     block.insert(block.end(), front.data.begin(),
                                  front.data.end());
                     taken += front.data.size();
-                    queue.queuedBytes -= front.data.size();
-                    queue.blocks.pop_front();
+                    destination.queue.queuedBytes -= front.data.size();
+                    destination.queue.blocks.pop_front();
                 } else {
                     block.insert(block.end(), front.data.begin(),
                                  front.data.begin() + need);
                     front.data.erase(front.data.begin(),
                                      front.data.begin() + need);
                     taken += need;
-                    queue.queuedBytes -= need;
+                    destination.queue.queuedBytes -= need;
                 }
             }
 
             return block;
         };
 
-        // 采集线程：只把 WASAPI 数据搬进队列，绝不等网络。
-        // 以前采集和发送挤在同一个循环里，socket 发送缓冲一满，
-        // WinHttpWriteData 就阻塞，阻塞期间 loopback 缓冲继续积压，
-        // 写通了再把积压一次性灌进内核发送缓冲——那才是 100~300ms 延迟的主体。
+        // 采集线程：一次 loopback 采集，按路复制到各自的发送队列。
         const auto startCaptureThread = [&]() {
             captureStop.store(false);
             captureFault.store(false);
 
-            // 显式捕获需要的东西，不依赖外层 lambda 的栈帧：
-            // startCaptureThread 返回后，这里的引用仍必须有效。
-            std::thread worker([&queue, &captureStop, &captureFault,
-                                &format, &sampleType, &captureClient,
-                                &audioCaptureEvent, &qpcFrequency,
-                                &enqueuePcm]() {
+            std::thread worker([&]() {
                 std::vector<int16_t> capturePcm;
+                std::vector<int16_t> channelPcm;
                 bool captureTimestampWarned = false;
 
                 while (!g_stop.load() && !captureStop.load()) {
@@ -1959,7 +1828,6 @@ int wmain(int argc, wchar_t* argv[])
                         captureFault.store(true);
                         break;
                     }
-                    // WAIT_TIMEOUT 只是轮询兜底，继续下一轮。
                     if (audioWait != WAIT_OBJECT_0)
                         continue;
 
@@ -1989,8 +1857,6 @@ int wmain(int argc, wchar_t* argv[])
                             break;
                         }
 
-                        // 这一包是否带可用的时间戳。
-                        // 具体“有多旧”由 enqueuePcm 统一判断。
                         bool timestampAvailable =
                             (flags &
                              AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) == 0 &&
@@ -2001,12 +1867,8 @@ int wmain(int argc, wchar_t* argv[])
                             captureTimestampWarned = true;
                         }
 
-                        // 丢帧不再在这里做：交给 enqueuePcm 按 WASAPI 时间戳
-                        // 判断这段音频有多旧，只保留最新的部分。
-                        // 这里只负责把这一包转成 s16 并带上它的时间戳。
                         if (frames > 0 && data != nullptr) {
                             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                                // 静音包：内存内容未定义，按零处理。
                                 capturePcm.assign(
                                     static_cast<size_t>(frames) *
                                         format->nChannels,
@@ -2020,8 +1882,56 @@ int wmain(int argc, wchar_t* argv[])
                                 break;
                             }
 
-                            enqueuePcm(capturePcm, qpcPosition, frames,
-                                       timestampAvailable);
+                            if (!capturePcm.empty()) {
+                                for (const auto& destinationPtr :
+                                     destinations) {
+                                    Destination& destination =
+                                        *destinationPtr;
+
+                                    if (destination.channelMode ==
+                                        ChannelMode::Stereo) {
+                                        enqueuePcm(
+                                            destination,
+                                            capturePcm,
+                                            qpcPosition,
+                                            frames,
+                                            timestampAvailable);
+                                        continue;
+                                    }
+
+                                    // L/R：只取第一/第二声道，输出单声道。
+                                    // 源本身是单声道时，两路都复制该声道。
+                                    const UINT32 channels =
+                                        format->nChannels;
+                                    const size_t wantedChannel =
+                                        destination.channelMode ==
+                                                ChannelMode::Left
+                                            ? 0
+                                            : 1;
+                                    const size_t sourceChannel =
+                                        std::min<size_t>(
+                                            wantedChannel,
+                                            static_cast<size_t>(channels) - 1);
+
+                                    channelPcm.resize(frames);
+                                    for (UINT32 frame = 0;
+                                         frame < frames;
+                                         ++frame) {
+                                        channelPcm[frame] =
+                                            capturePcm[
+                                                static_cast<size_t>(frame) *
+                                                    channels +
+                                                sourceChannel];
+                                    }
+
+                                    enqueuePcm(
+                                        destination,
+                                        channelPcm,
+                                        qpcPosition,
+                                        frames,
+                                        timestampAvailable);
+                                }
+                            }
                         }
 
                         captureClient->ReleaseBuffer(frames);
@@ -2038,436 +1948,630 @@ int wmain(int argc, wchar_t* argv[])
                     }
                 }
             });
-            // 正常流程里 startCaptureThread 只在 !captureRunning 时调用，
-            // 而 stopCaptureThread 一定会 join；这里再防一次，避免误用。
+
             if (captureThread.joinable())
                 captureThread.join();
             captureThread = std::move(worker);
-            captureRunning = true;
         };
 
-        const auto stopCaptureThread = [&]() {
-            captureStop.store(true);
-            if (captureRunning) {
-                if (captureThread.joinable())
-                    captureThread.join();
-                captureRunning = false;
+        // 每路一个发送线程：独立的 HTTP 连接、重连计数、队列和写入统计。
+        const auto runSender = [&](Destination& destination) {
+            const DWORD sampleRate = format->nSamplesPerSec;
+            const UINT32 outChannels = destination.outChannels;
+
+            std::wstring finalUrl = BuildAudioUrl(
+                destination.url,
+                sampleRate,
+                static_cast<WORD>(outChannels));
+
+            if (finalUrl.empty()) {
+                std::wcerr
+                    << L"[dest " << (destination.index + 1)
+                    << L"] Invalid URL.\n";
+                return;
             }
-            captureStop.store(false);
-            captureFault.store(false);
 
-            // 复位时间戳校准：WASAPI 重新 Start 后 qpcPosition 的基准可能变，
-            // 旧偏移不再成立，会让 age 系统性偏大、每包都超阈值，
-            // 表现为断连恢复后一直不停地丢 10ms。
-            // 让重连后的第一个包重新建立偏移。
-            qpcOffsetValid = false;
-            qpcOffset100ns = 0.0;
-            captureDropActive = false;
-            queueTrimActive = false;
+            UrlParts activeParts;
+            if (!CrackUrl(finalUrl, activeParts)) {
+                std::wcerr
+                    << L"[dest " << (destination.index + 1)
+                    << L"] Invalid URL.\n";
+                return;
+            }
 
-            clearSendQueue();
-        };
+            {
+                std::lock_guard<std::mutex> lock(destination.partsMutex);
+                destination.activeParts = activeParts;
+            }
 
-        // 音量请求走独立线程：SendVolumeRequest 是同步 HTTP 调用，
-        // 超时 1 秒，跑在发送线程上会把音频卡住最多 1 秒，
-        // 期间队列持续积累，恢复后只能丢掉一大段（实测 270ms）。
-        std::atomic_bool volumeThreadStop{false};
-        std::thread volumeThread;
+            HINTERNET session = nullptr;
+            HINTERNET connect = nullptr;
+            HINTERNET request = nullptr;
+            WriteStats stats;
 
-        const auto startVolumeThread = [&]() {
-            volumeThreadStop.store(false);
-            volumeThread = std::thread([&]() {
-                while (!g_stop.load() && !volumeThreadStop.load()) {
-                    HandlePendingVolumeRequests(activeParts);
+            bool hasStreamedSuccessfully = false;
+            bool connected = false;
+            bool streamConfirmed = false;
+            int successfulChunks = 0;
+            int autoReconnectAttempts = 0;
+            bool retryAfterDelay = false;
+            bool serviceRetryDelay = false;
+            bool shortReconnectDelay = false;
+            bool waitingForEnter = false;
+
+            auto lastDiagTime = std::chrono::steady_clock::now();
+            size_t diagSentBytes = 0;
+
+            const auto publishActiveParts = [&]() {
+                std::lock_guard<std::mutex> lock(
+                    destination.partsMutex);
+                destination.activeParts = activeParts;
+            };
+
+            const auto closeHttp = [&]() {
+                if (request) {
+                    WinHttpCloseHandle(request);
+                    request = nullptr;
+                }
+                if (connect) {
+                    WinHttpCloseHandle(connect);
+                    connect = nullptr;
+                }
+                if (session) {
+                    WinHttpCloseHandle(session);
+                    session = nullptr;
+                }
+            };
+
+            const auto openHttp = [&]() -> bool {
+                for (;;) {
+                    closeHttp();
+                    DWORD failureError = ERROR_SUCCESS;
+
+                    session = WinHttpOpen(
+                        L"workdayAlarmClockGo/1.0",
+                        WINHTTP_ACCESS_TYPE_NO_PROXY,
+                        WINHTTP_NO_PROXY_NAME,
+                        WINHTTP_NO_PROXY_BYPASS,
+                        0);
+
+                    if (!session) {
+                        failureError = GetLastError();
+                        PrintWinError(L"WinHttpOpen", failureError);
+                    } else {
+                        WinHttpSetTimeouts(
+                            session, 5000, 5000, 5000, 5000);
+
+                        connect = WinHttpConnect(
+                            session,
+                            activeParts.host.c_str(),
+                            activeParts.port,
+                            0);
+
+                        if (!connect) {
+                            failureError = GetLastError();
+                            PrintWinError(
+                                L"WinHttpConnect", failureError);
+                        } else {
+                            request = WinHttpOpenRequest(
+                                connect,
+                                L"PUT",
+                                activeParts.path.c_str(),
+                                nullptr,
+                                WINHTTP_NO_REFERER,
+                                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                activeParts.https
+                                    ? WINHTTP_FLAG_SECURE
+                                    : 0);
+
+                            if (!request) {
+                                failureError = GetLastError();
+                                PrintWinError(
+                                    L"WinHttpOpenRequest",
+                                    failureError);
+                            } else {
+                                const wchar_t headers[] =
+                                    L"Content-Type: application/octet-stream\r\n"
+                                    L"Content-Length: 68719476735\r\n"
+                                    L"Expect: 100-continue\r\n";
+
+                                if (WinHttpSendRequest(
+                                        request,
+                                        headers,
+                                        static_cast<DWORD>(-1),
+                                        WINHTTP_NO_REQUEST_DATA,
+                                        0,
+                                        WINHTTP_IGNORE_REQUEST_TOTAL_LENGTH,
+                                        0)) {
+                                    return true;
+                                }
+
+                                failureError = GetLastError();
+                                PrintWinError(
+                                    L"WinHttpSendRequest",
+                                    failureError);
+                            }
+                        }
+                    }
+
+                    closeHttp();
+
+                    if (!hasStreamedSuccessfully &&
+                        IsConnectionFailure(failureError) &&
+                        AdvancePortFallback(activeParts)) {
+                        publishActiveParts();
+                        std::wcout
+                            << L"[dest " << (destination.index + 1)
+                            << L"] Cannot connect; trying port "
+                            << activeParts.port << L".\n";
+                        continue;
+                    }
+
+                    return false;
+                }
+            };
+
+            const auto waitFor = [&](std::chrono::milliseconds duration) {
+                const auto end =
+                    std::chrono::steady_clock::now() + duration;
+
+                while (!g_stop.load() && !destination.stop.load() &&
+                       !destination.reconnectRequested.load()) {
+                    if (std::chrono::steady_clock::now() >= end)
+                        break;
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(20));
                 }
-            });
-        };
+            };
 
-        const auto stopVolumeThread = [&]() {
-            volumeThreadStop.store(true);
-            if (volumeThread.joinable())
-                volumeThread.join();
-        };
-
-        startVolumeThread();
-
-        while (!g_stop.load()) {
-            if (!connected) {
-                if (serviceRetryDelay) {
-                    SleepWhileHandlingVolumeRequests(
-                        kServiceRetryDelay,
-                        activeParts);
-                } else if (retryAfterDelay) {
-                    SleepWhileHandlingVolumeRequests(
-                        std::chrono::seconds(1),
-                        activeParts);
-                } else if (shortReconnectDelay) {
-                    // 200 ms 等待期间采集已经 Stop+Reset，因此不会产生新的音频积压。
-                    SleepWhileHandlingVolumeRequests(
-                        kCongestionReconnectDelay,
-                        activeParts);
-                }
-
-                if (g_stop.load())
-                    break;
-
-                if (!refreshAudioDevice()) {
-                    std::wcerr
-                        << L"Audio capture reinitialization failed. Retrying in 1 second.\n";
-                    retryAfterDelay = true;
-                    shortReconnectDelay = false;
-                    continue;
-                }
-
-                std::wcout << L"Connecting...\n";
-                connected = openHttp();
-
-                retryAfterDelay = false;
-                shortReconnectDelay = false;
-
-                if (!connected) {
-                    ++autoReconnectAttempts;
-                    if (serviceMode && serviceRetryDelay) {
-                        // 已进入后台重试阶段：之后每次失败都固定等待 10 秒。
-                        std::wcerr
-                            << L"HTTP connect failed; retrying in 10 seconds.\n";
-                        retryAfterDelay = false;
-                        shortReconnectDelay = false;
-                    } else if (autoReconnectAttempts < kMaxAutoReconnectAttempts) {
-                        std::wcerr
-                            << L"HTTP connect failed; retrying in 1 second (attempt "
-                            << autoReconnectAttempts << L"/" << kMaxAutoReconnectAttempts << L")...\n";
-                        retryAfterDelay = true;
-                        shortReconnectDelay = false;
-                    } else if (serviceMode) {
-                        std::wcerr
-                            << L"Reconnect failed 3 times; retrying in 10 seconds.\n";
-                        retryAfterDelay = false;
-                        serviceRetryDelay = true;
-                        shortReconnectDelay = false;
-                    } else {
-                        std::wcerr
-                            << L"Reconnect failed 3 times; press Enter to retry.\n";
-                        retryAfterDelay = false;
-                        shortReconnectDelay = false;
-                        while (!g_stop.load()) {
-                            HandlePendingVolumeRequests(activeParts);
-                            if ((_kbhit() && _getch() == '\r') ||
-                                g_reconnectRequested.exchange(false)) {
-                                autoReconnectAttempts = 0;
-                                shortReconnectDelay = true;
-                                break;
-                            }
-                            std::this_thread::sleep_for(
-                                std::chrono::milliseconds(50));
-                        }
-                    }
-                    continue;
-                }
-
-                // HTTP 连接成功后才恢复采集。此前整个等待/重连过程都不会积累 WASAPI 数据。
-                if (!startAudioCapture()) {
-                    closeHttp();
-                    connected = false;
-                    ++autoReconnectAttempts;
-                    if (serviceMode && serviceRetryDelay) {
-                        retryAfterDelay = false;
-                    } else {
-                        retryAfterDelay = true;
-                    }
-                    ResetWriteStats();
-                    continue;
-                }
-
-                ResetWriteStats();
+            const auto markDisconnected = [&]() {
+                connected = false;
                 streamConfirmed = false;
-                successfulChunks = 0;
-                clearSendQueue();
-                std::wcout
-                    << L"HTTP connected; waiting for audio writes...\n";
-            }
+            };
 
-            const bool reconnectRequested =
-                g_reconnectRequested.exchange(false);
-            const bool consoleKeyAvailable = _kbhit() != 0;
-            if (consoleKeyAvailable || reconnectRequested) {
-                const int key = consoleKeyAvailable ? _getch() : 0;
-
-                // Windows 控制台方向键：0/224 后跟具体键值，↑=72，↓=80。
-                if (!reconnectRequested && (key == 0 || key == 224)) {
-                    const int arrow = _getch();
-
-                    // 只投递请求，由音量线程去做同步 HTTP，
-                    // 避免把发送线程卡住导致音频积压。
-                    if (arrow == 72) {
-                        ++g_volumeUpRequests;
-                    } else if (arrow == 80) {
-                        ++g_volumeDownRequests;
-                    }
-
-                    continue;
-                }
-
-                if (key == '\r' || reconnectRequested) {
-                    std::wcout << L"Reconnect requested; flushing capture and refreshing audio output device.\n";
+            while (!g_stop.load() && !destination.stop.load()) {
+                if (destination.reconnectRequested.exchange(false)) {
                     closeHttp();
-                    connected = false;
-                    streamConfirmed = false;
+                    markDisconnected();
                     successfulChunks = 0;
                     autoReconnectAttempts = 0;
                     retryAfterDelay = false;
                     serviceRetryDelay = false;
                     shortReconnectDelay = true;
+                    waitingForEnter = false;
+                    stats = WriteStats{};
+                    clearSendQueue(destination);
+                    std::wcout
+                        << L"[dest " << (destination.index + 1)
+                        << L"] Reconnect requested.\n";
+                }
 
-                    // 先停采集线程，再 Stop+Reset 丢弃捕获积压，
-                    // 并给服务端时间释放旧连接。
-                    stopCaptureThread();
-
-                    if (!stopAndFlushAudioCapture()) {
-                        std::wcerr
-                            << L"Failed to flush audio capture; will rebuild it during reconnect.\n";
+                if (!connected) {
+                    if (waitingForEnter) {
+                        while (!g_stop.load() &&
+                               !destination.stop.load() &&
+                               !destination.reconnectRequested.load()) {
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(50));
+                        }
+                        if (g_stop.load() || destination.stop.load())
+                            break;
+                        continue;
                     }
 
-                    ResetWriteStats();
-                    continue;
+                    if (serviceRetryDelay) {
+                        waitFor(
+                            std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                kServiceRetryDelay));
+                    } else if (retryAfterDelay) {
+                        waitFor(std::chrono::seconds(1));
+                    } else if (shortReconnectDelay) {
+                        waitFor(
+                            std::chrono::duration_cast<
+                                std::chrono::milliseconds>(
+                                kCongestionReconnectDelay));
+                    }
+
+                    if (g_stop.load() || destination.stop.load())
+                        break;
+                    if (destination.reconnectRequested.load())
+                        continue;
+
+                    std::wcout
+                        << L"[dest " << (destination.index + 1)
+                        << L"] Connecting...\n";
+
+                    connected = openHttp();
+                    retryAfterDelay = false;
+                    shortReconnectDelay = false;
+
+                    if (!connected) {
+                        ++autoReconnectAttempts;
+
+                        if (serviceMode && serviceRetryDelay) {
+                            std::wcerr
+                                << L"[dest "
+                                << (destination.index + 1)
+                                << L"] HTTP connect failed; retrying in 10 seconds.\n";
+                            retryAfterDelay = false;
+                        } else if (
+                            autoReconnectAttempts <
+                            kMaxAutoReconnectAttempts) {
+                            std::wcerr
+                                << L"[dest "
+                                << (destination.index + 1)
+                                << L"] HTTP connect failed; retrying in 1 second (attempt "
+                                << autoReconnectAttempts
+                                << L"/"
+                                << kMaxAutoReconnectAttempts
+                                << L")...\n";
+                            retryAfterDelay = true;
+                        } else if (serviceMode) {
+                            std::wcerr
+                                << L"[dest "
+                                << (destination.index + 1)
+                                << L"] Reconnect failed 3 times; retrying in 10 seconds.\n";
+                            serviceRetryDelay = true;
+                            retryAfterDelay = false;
+                        } else {
+                            std::wcerr
+                                << L"[dest "
+                                << (destination.index + 1)
+                                << L"] Reconnect failed 3 times; press Enter to retry.\n";
+                            waitingForEnter = true;
+                            retryAfterDelay = false;
+                        }
+
+                        continue;
+                    }
+
+                    publishActiveParts();
+                    stats = WriteStats{};
+                    streamConfirmed = false;
+                    successfulChunks = 0;
+                    clearSendQueue(destination);
+                    lastDiagTime = std::chrono::steady_clock::now();
+                    diagSentBytes = 0;
+
+                    std::wcout
+                        << L"[dest " << (destination.index + 1)
+                        << L"] HTTP connected; waiting for audio writes...\n";
                 }
-            }
 
-            // 采集在独立线程里跑，主循环只负责把队列里的数据写出去。
-            // 这样 socket 发送缓冲满的时候，阻塞的只有发送这一侧，
-            // 采集侧不会跟着积压，queued audio age 也就不会滚到几百毫秒。
-            if (connected && !captureRunning)
-                startCaptureThread();
-
-            // 发送：有数据就发，由采集线程的数据到达驱动。
-            //
-            // 采集线程被 WASAPI 事件唤醒，事件频率就是音频产生的频率，
-            // 所以“有数据就发”的发送速率天然等于实时速率，
-            // 不需要另建一个定时器去追——那正是之前 95% 速率的来源：
-            // sleep_until 睡过头，节拍又把它重置掉，误差就永久累积了。
-            if (connected) {
-                // 攒够最小写出量再发，避免 WASAPI 包很小时写调用过碎。
-                // 这个下限只是把碎片合并，不会引入节拍或累积误差。
                 size_t readyBytes = 0;
                 {
-                    std::lock_guard<std::mutex> lock(queue.mutex);
-                    readyBytes = queue.queuedBytes;
+                    std::lock_guard<std::mutex> lock(
+                        destination.queue.mutex);
+                    readyBytes = destination.queue.queuedBytes;
                 }
 
                 std::vector<BYTE> block;
-                if (readyBytes >= minSendBytes)
-                    block = takeSendBlock();
+                if (readyBytes >= destination.minSendBytes)
+                    block = takeSendBlock(destination);
 
                 if (!block.empty()) {
-                    if (!WritePcm(request, block.data(),
-                                  static_cast<DWORD>(block.size()))) {
-                        connected = false;
+                    if (!WritePcm(
+                            request,
+                            block.data(),
+                            static_cast<DWORD>(block.size()),
+                            stats)) {
+                        markDisconnected();
                     } else {
                         ++successfulChunks;
-                        if (!streamConfirmed && successfulChunks >= 3) {
+
+                        if (!streamConfirmed &&
+                            successfulChunks >= 3) {
                             streamConfirmed = true;
                             hasStreamedSuccessfully = true;
                             autoReconnectAttempts = 0;
                             serviceRetryDelay = false;
                             retryAfterDelay = false;
                             std::wcout
-                                << L"Connected. Audio data flowing.\n";
+                                << L"[dest "
+                                << (destination.index + 1)
+                                << L"] Connected. Audio data flowing.\n";
                         }
+
                         diagSentBytes += block.size();
                     }
                 } else {
-                    // 队列空了：等采集线程填数据。
-                    // 采集侧的事件周期约 10ms，睡 1ms 足够及时醒来。
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(1));
                 }
 
-                // 每 5 秒打一次发送侧状态：队列深度、发送速率、写入耗时。
-                const auto nowDiag = std::chrono::steady_clock::now();
-                if (nowDiag - lastDiagTime >= std::chrono::seconds(5)) {
-                    const double elapsedSec =
-                        std::chrono::duration<double>(nowDiag - lastDiagTime)
-                            .count();
-                    size_t queuedNow = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(queue.mutex);
-                        queuedNow = queue.queuedBytes;
-                    }
-                    const double sentMs = diagSentBytes / sendBytesPerMs;
-                    const double realtimeRatio =
-                        elapsedSec > 0.0
-                            ? sentMs / (elapsedSec * 1000.0)
-                            : 0.0;
+                if (connected) {
+                    const auto nowDiag =
+                        std::chrono::steady_clock::now();
 
-                    // 队列头那块音频有多旧：这是最接近“用户听到的延迟”的数字。
-                    // 用和丢弃判断相同的校准偏移，保证日志和实际行为一致。
-                    double headAgeMs = -1.0;
-                    {
-                        std::lock_guard<std::mutex> lock(queue.mutex);
-                        if (!queue.blocks.empty() &&
-                            queue.blocks.front().hasTimestamp) {
-                            LARGE_INTEGER nowQpc{};
-                            if (QueryPerformanceCounter(&nowQpc)) {
-                                const double now100ns =
-                                    static_cast<double>(nowQpc.QuadPart) *
-                                        10000000.0 /
+                    if (nowDiag - lastDiagTime >=
+                        std::chrono::seconds(5)) {
+                        const double elapsedSec =
+                            std::chrono::duration<double>(
+                                nowDiag - lastDiagTime)
+                                .count();
+
+                        size_t queuedNow = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                destination.queue.mutex);
+                            queuedNow =
+                                destination.queue.queuedBytes;
+                        }
+
+                        const double sentMs =
+                            diagSentBytes /
+                            destination.sendBytesPerMs;
+                        const double realtimeRatio =
+                            elapsedSec > 0.0
+                                ? sentMs /
+                                      (elapsedSec * 1000.0)
+                                : 0.0;
+
+                        double headAgeMs = -1.0;
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                destination.queue.mutex);
+                            if (!destination.queue.blocks.empty() &&
+                                destination.queue.blocks.front()
+                                    .hasTimestamp &&
+                                qpcOffsetValid.load(
+                                    std::memory_order_acquire)) {
+                                LARGE_INTEGER nowQpc{};
+                                if (QueryPerformanceCounter(&nowQpc)) {
+                                    const double now100ns =
                                         static_cast<double>(
-                                            qpcFrequency.QuadPart) +
-                                    qpcOffset100ns;
-                                const PcmBlock& head = queue.blocks.front();
-                                const double end100ns =
-                                    static_cast<double>(head.qpcStart) +
-                                    static_cast<double>(head.frames) *
-                                        10000000.0 /
+                                            nowQpc.QuadPart) *
+                                            10000000.0 /
+                                            static_cast<double>(
+                                                qpcFrequency.QuadPart) +
+                                        qpcOffset100ns.load(
+                                            std::memory_order_relaxed);
+                                    const PcmBlock& head =
+                                        destination.queue.blocks.front();
+                                    const double end100ns =
                                         static_cast<double>(
-                                            format->nSamplesPerSec);
-                                headAgeMs = (now100ns - end100ns) / 10000.0;
+                                            head.qpcStart) +
+                                        static_cast<double>(
+                                            head.frames) *
+                                            10000000.0 /
+                                            static_cast<double>(
+                                                format->nSamplesPerSec);
+                                    headAgeMs =
+                                        (now100ns - end100ns) /
+                                        10000.0;
+                                }
+                            }
+                        }
+
+                        std::wcout
+                            << L"[send "
+                            << (destination.index + 1)
+                            << L"] queued "
+                            << static_cast<long long>(
+                                   static_cast<double>(queuedNow) /
+                                   destination.sendBytesPerMs)
+                            << L" ms; age "
+                            << static_cast<long long>(headAgeMs)
+                            << L" ms; sent "
+                            << static_cast<long long>(sentMs)
+                            << L" ms in "
+                            << static_cast<long long>(
+                                   elapsedSec * 1000.0)
+                            << L" ms ("
+                            << static_cast<long long>(
+                                   realtimeRatio * 100.0)
+                            << L"% of realtime); write max "
+                            << static_cast<long long>(
+                                   stats.writeMaxMs)
+                            << L" ms, >=1ms "
+                            << stats.writeOver1MsCalls
+                            << L"/"
+                            << stats.writeCalls
+                            << L"\n";
+
+                        lastDiagTime = nowDiag;
+                        diagSentBytes = 0;
+                        stats.writeCalls = 0;
+                        stats.writeOver1MsCalls = 0;
+                        stats.writeMaxMs = 0.0;
+                        stats.blockedMs = 0.0;
+                    }
+                }
+
+                if (!connected && !g_stop.load() &&
+                    !destination.stop.load()) {
+                    DWORD httpStatus = 0;
+                    std::string responseBody;
+                    std::wstring location;
+                    bool portFallbackApplied = false;
+
+                    if (request) {
+                        if (ReadHttpResponse(
+                                request,
+                                httpStatus,
+                                responseBody,
+                                location)) {
+                            PrintHttpResponse(
+                                httpStatus,
+                                responseBody,
+                                location);
+
+                            if (httpStatus >= 300 &&
+                                httpStatus < 400) {
+                                UrlParts redirected;
+                                bool redirectedOk =
+                                    !location.empty() &&
+                                    CrackUrl(
+                                        location,
+                                        redirected);
+
+                                if (redirectedOk) {
+                                    SetQueryParameter(
+                                        redirected.path,
+                                        L"rate",
+                                        std::to_wstring(
+                                            sampleRate));
+                                    SetQueryParameter(
+                                        redirected.path,
+                                        L"channels",
+                                        std::to_wstring(
+                                            outChannels));
+                                    activeParts = redirected;
+                                    publishActiveParts();
+
+                                    std::wcout
+                                        << L"[dest "
+                                        << (destination.index + 1)
+                                        << L"] Following HTTP redirect to "
+                                        << (activeParts.https
+                                                ? L"https://"
+                                                : L"http://")
+                                        << activeParts.host
+                                        << L":"
+                                        << activeParts.port
+                                        << activeParts.path
+                                        << L"\n";
+                                } else if (
+                                    !hasStreamedSuccessfully &&
+                                    AdvancePortFallback(
+                                        activeParts)) {
+                                    portFallbackApplied = true;
+                                    publishActiveParts();
+                                    std::wcout
+                                        << L"[dest "
+                                        << (destination.index + 1)
+                                        << L"] HTTP redirect detected; trying port "
+                                        << activeParts.port
+                                        << L".\n";
+                                }
                             }
                         }
                     }
 
-                    std::wcout
-                        << L"[send] queued "
-                        << static_cast<long long>(
-                               static_cast<double>(queuedNow) / sendBytesPerMs)
-                        << L" ms; age "
-                        << static_cast<long long>(headAgeMs)
-                        << L" ms; sent "
-                        << static_cast<long long>(sentMs)
-                        << L" ms in "
-                        << static_cast<long long>(elapsedSec * 1000.0)
-                        << L" ms ("
-                        << static_cast<long long>(realtimeRatio * 100.0)
-                        << L"% of realtime); write max "
-                        << static_cast<long long>(g_writeMaxMs)
-                        << L" ms, >=1ms "
-                        << g_writeOver1MsCalls << L"/" << g_writeCalls
-                        << L"\n";
-
-                    lastDiagTime = nowDiag;
-                    diagSentBytes = 0;
-                    g_writeCalls = 0;
-                    g_writeOver1MsCalls = 0;
-                    g_writeMaxMs = 0.0;
-                }
-            }
-
-            // 采集侧出错（设备被拔、GetBuffer 失败）：按断线处理。
-            if (connected && captureFault.load())
-                connected = false;
-
-
-            if (!connected && !g_stop.load()) {
-                DWORD httpStatus = 0;
-                std::string responseBody;
-                std::wstring location;
-                bool portFallbackApplied = false;
-
-                // WinHttpWriteData 失败时，服务端可能已经返回 404/500/302。
-                // 尝试把响应读出来，至少把状态码和 JSON 错误打印给用户。
-                if (request) {
-                    if (ReadHttpResponse(request, httpStatus, responseBody, location)) {
-                        PrintHttpResponse(httpStatus, responseBody, location);
-
-                        // 302/301/307/308：优先跟随 Location。对于常见的
-                        // 8080 -> 8880 重定向，即使 Location 没拿到，也走 8880。
-                        if (httpStatus >= 300 && httpStatus < 400) {
-                            UrlParts redirected;
-                            bool redirectedOk =
-                                !location.empty() &&
-                                CrackUrl(location, redirected);
-
-                            if (redirectedOk) {
-                                SetQueryParameter(
-                                    redirected.path, L"rate",
-                                    std::to_wstring(format->nSamplesPerSec));
-                                SetQueryParameter(
-                                    redirected.path, L"channels",
-                                    std::to_wstring(format->nChannels));
-                                activeParts = redirected;
-                                std::wcout
-                                    << L"Following HTTP redirect to "
-                                    << (activeParts.https ? L"https://" : L"http://")
-                                    << activeParts.host << L":" << activeParts.port
-                                    << activeParts.path << L"\n";
-                            } else if (!hasStreamedSuccessfully &&
-                                       AdvancePortFallback(activeParts)) {
-                                portFallbackApplied = true;
-                                std::wcout
-                                    << L"HTTP redirect detected; trying port "
-                                    << activeParts.port << L".\n";
-                            }
-                        }
+                    if (!hasStreamedSuccessfully &&
+                        !portFallbackApplied &&
+                        IsConnectionFailure(
+                            stats.lastWinHttpError) &&
+                        AdvancePortFallback(activeParts)) {
+                        publishActiveParts();
+                        std::wcout
+                            << L"[dest "
+                            << (destination.index + 1)
+                            << L"] WinHTTP connection error; trying port "
+                            << activeParts.port
+                            << L".\n";
                     }
-                }
 
-                if (!hasStreamedSuccessfully &&
-                    !portFallbackApplied &&
-                    IsConnectionFailure(g_lastWinHttpError) &&
-                    AdvancePortFallback(activeParts)) {
-                    std::wcout
-                        << L"WinHTTP connection error; trying port "
-                        << activeParts.port << L".\n";
-                }
+                    closeHttp();
+                    markDisconnected();
+                    ++autoReconnectAttempts;
 
-                closeHttp();
-                stopCaptureThread();
-                stopAndFlushAudioCapture();
-                streamConfirmed = false;
-
-                ++autoReconnectAttempts;
-
-                if (serviceMode && serviceRetryDelay) {
-                    // 已进入后台重试阶段：之后每次失败都固定等待 10 秒。
-                    std::wcerr
-                        << L"Connection interrupted; capture stopped, retrying in 10 seconds.\n";
-                    retryAfterDelay = false;
-                    shortReconnectDelay = false;
-                } else if (autoReconnectAttempts < kMaxAutoReconnectAttempts) {
-                    std::wcerr
-                        << L"Connection interrupted; capture stopped, retrying in 1 second (attempt "
-                        << autoReconnectAttempts << L"/" << kMaxAutoReconnectAttempts << L").\n";
-                    retryAfterDelay = true;
-                    shortReconnectDelay = false;
-                } else if (serviceMode) {
-                    std::wcerr
-                        << L"Reconnect failed 3 times; retrying automatically in 10 seconds.\n";
-                    retryAfterDelay = false;
-                    serviceRetryDelay = true;
-                    shortReconnectDelay = false;
-                } else {
-                    std::wcerr
-                        << L"Reconnect failed 3 times; press Enter to retry.\n";
-                    retryAfterDelay = false;
-                    serviceRetryDelay = false;
-                    shortReconnectDelay = false;
-
-                    while (!g_stop.load()) {
-                        HandlePendingVolumeRequests(activeParts);
-                        if ((_kbhit() && _getch() == '\r') ||
-                            g_reconnectRequested.exchange(false)) {
-                            autoReconnectAttempts = 0;
-                            shortReconnectDelay = true;
-                            break;
-                        }
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(50));
+                    if (serviceMode && serviceRetryDelay) {
+                        std::wcerr
+                            << L"[dest "
+                            << (destination.index + 1)
+                            << L"] Connection interrupted; retrying in 10 seconds.\n";
+                        retryAfterDelay = false;
+                        shortReconnectDelay = false;
+                    } else if (
+                        autoReconnectAttempts <
+                        kMaxAutoReconnectAttempts) {
+                        std::wcerr
+                            << L"[dest "
+                            << (destination.index + 1)
+                            << L"] Connection interrupted; retrying in 1 second (attempt "
+                            << autoReconnectAttempts
+                            << L"/"
+                            << kMaxAutoReconnectAttempts
+                            << L").\n";
+                        retryAfterDelay = true;
+                        shortReconnectDelay = false;
+                    } else if (serviceMode) {
+                        std::wcerr
+                            << L"[dest "
+                            << (destination.index + 1)
+                            << L"] Reconnect failed 3 times; retrying automatically in 10 seconds.\n";
+                        retryAfterDelay = false;
+                        serviceRetryDelay = true;
+                        shortReconnectDelay = false;
+                    } else {
+                        std::wcerr
+                            << L"[dest "
+                            << (destination.index + 1)
+                            << L"] Reconnect failed 3 times; press Enter to retry.\n";
+                        retryAfterDelay = false;
+                        serviceRetryDelay = false;
+                        shortReconnectDelay = false;
+                        waitingForEnter = true;
                     }
                 }
             }
+
+            closeHttp();
+        };
+
+        // 先启动发送线程，再启动采集；避免刚启动时队列短暂无人消费。
+        senderThreads.reserve(destinations.size());
+        for (const auto& destination : destinations) {
+            Destination* destinationPtr = destination.get();
+            senderThreads.emplace_back(
+                [&runSender, destinationPtr]() {
+                    runSender(*destinationPtr);
+                });
         }
 
-        stopVolumeThread();
-        stopCaptureThread();
-        audioClient->Stop();
+        startCaptureThread();
 
-        // 连续 PCM body 使用长 Content-Length，不发送 chunk 结束标记。
-        // 停止/重连时直接关闭请求，服务端会结束当前 body。
-        closeHttp();
+        std::wcout
+            << L"Press Enter to reconnect all, Ctrl+C to stop.\n";
 
-    } while (false);
+        bool captureFailed = false;
+
+        while (!g_stop.load()) {
+            if (g_reconnectRequested.exchange(false)) {
+                for (const auto& destination : destinations)
+                    destination->reconnectRequested.store(true);
+            }
+
+            if (_kbhit()) {
+                const int key = _getch();
+
+                // Windows 控制台方向键：0/224 后跟具体键值，↑=72，↓=80。
+                if (key == 0 || key == 224) {
+                    const int arrow = _getch();
+
+                    if (arrow == 72) {
+                        ++g_volumeUpRequests;
+                    } else if (arrow == 80) {
+                        ++g_volumeDownRequests;
+                    }
+                } else if (key == '\r') {
+                    std::wcout
+                        << L"Reconnect requested for all destinations.\n";
+                    for (const auto& destination : destinations)
+                        destination->reconnectRequested.store(true);
+                }
+            }
+
+            if (captureFault.load()) {
+                std::wcerr
+                    << L"Audio capture failed; exiting.\n";
+                captureFailed = true;
+                g_stop.store(true);
+                break;
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(20));
+        }
+
+        stopThreads();
+
+        return !captureFailed;
+    };
+
+    ok = run();
 
     if (keyboardHookStarted)
         StopKeyboardHook();
@@ -2478,8 +2582,10 @@ int wmain(int argc, wchar_t* argv[])
     if (captureClient)
         captureClient->Release();
 
-    if (audioClient)
+    if (audioClient) {
+        audioClient->Stop();
         audioClient->Release();
+    }
 
     if (device)
         device->Release();
@@ -2487,17 +2593,8 @@ int wmain(int argc, wchar_t* argv[])
     if (enumerator)
         enumerator->Release();
 
-    if (request)
-        WinHttpCloseHandle(request);
-
     if (audioCaptureEvent)
         CloseHandle(audioCaptureEvent);
-
-    if (connect)
-        WinHttpCloseHandle(connect);
-
-    if (session)
-        WinHttpCloseHandle(session);
 
     CoUninitialize();
 
