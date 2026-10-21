@@ -86,6 +86,14 @@ static constexpr auto kServiceRetryDelay = std::chrono::seconds(10);
 // 拥塞/手动重连：先停采集并清空捕获缓冲，等待服务端释放旧的 aplay 后再恢复采集。
 static constexpr auto kCongestionReconnectDelay = std::chrono::milliseconds(200);
 
+// 启动/整体重建时，等所有目标都连上再开采集。
+// 各路建流速度不同，先连上的那一路会多收几百毫秒音频，
+// 两台设备之间就留下一个固定的初始偏移，之后再也追不回来。
+// 等全部连上再统一 Start，各路从同一时刻开始收数据，初始偏移就没了。
+// 但只要有目标彻底放弃（等待回车/服务模式退避），就不该让其他路跟着没声音，
+// 所以最多等这么久就先开采集。
+static constexpr auto kCaptureGateTimeout = std::chrono::milliseconds(3000);
+
 
 // 队列里的一段 PCM（已转换成 s16le），带它在系统时钟上的位置。
 //
@@ -463,6 +471,13 @@ struct Destination {
 
     std::atomic_bool stop{false};
     std::atomic_bool reconnectRequested{false};
+
+    // 启动/重建时的“起跑线”标志：
+    // captureReady 表示本路 HTTP 已经连上、可以接收音频；
+    // captureGaveUp 表示本路已经放弃（等回车或服务模式退避），
+    // 这时不能再让其他路陪着一起等。
+    std::atomic_bool captureReady{false};
+    std::atomic_bool captureGaveUp{false};
 
     // 仅采集线程访问的日志状态，每路独立，避免互相影响。
     bool captureDropActive = false;
@@ -2267,6 +2282,7 @@ int wmain(int argc, wchar_t* argv[])
                                 << L"] Reconnect failed 3 times; retrying in 10 seconds.\n";
                             serviceRetryDelay = true;
                             retryAfterDelay = false;
+                            destination.captureGaveUp.store(true);
                         } else {
                             std::wcerr
                                 << L"[dest "
@@ -2274,6 +2290,7 @@ int wmain(int argc, wchar_t* argv[])
                                 << L"] Reconnect failed 3 times; press Enter to retry.\n";
                             waitingForEnter = true;
                             retryAfterDelay = false;
+                            destination.captureGaveUp.store(true);
                         }
 
                         continue;
@@ -2286,6 +2303,9 @@ int wmain(int argc, wchar_t* argv[])
                     clearSendQueue(destination);
                     lastDiagTime = std::chrono::steady_clock::now();
                     diagSentBytes = 0;
+
+                    // 已连上，可以接收音频了。启动流程会等所有路都置位后才开采集。
+                    destination.captureReady.store(true);
 
                     std::wcout
                         << L"[dest " << (destination.index + 1)
@@ -2520,6 +2540,10 @@ int wmain(int argc, wchar_t* argv[])
                     markDisconnected();
                     ++autoReconnectAttempts;
 
+                    // 这一路暂时没流了；启动流程若还在等，就别让它一直等下去。
+                    destination.captureReady.store(false);
+                    destination.captureGaveUp.store(true);
+
                     if (serviceMode && serviceRetryDelay) {
                         std::wcerr
                             << L"[dest "
@@ -2576,11 +2600,82 @@ int wmain(int argc, wchar_t* argv[])
             }
         };
 
+        // 等所有目标都连上再开采集，让各路从同一时刻开始收数据。
+        // 一路建流快、一路慢，如果采集先跑起来，先连上的那路会多吃一段音频，
+        // 两台设备之间就永久差这么多，后面无论怎么丢包都追不回来。
+        // 只要有一路彻底放弃（等回车/服务模式退避），就不再等它，先让其余路出声；
+        // 另外最多等 kCaptureGateTimeout，避免服务端慢到把整条链路拖死。
+        const auto waitForAllDestinationsConnected = [&]() {
+            const auto deadline =
+                std::chrono::steady_clock::now() + kCaptureGateTimeout;
+
+            while (!g_stop.load()) {
+                bool allReady = true;
+
+                for (const auto& destination : destinations) {
+                    if (destination->captureGaveUp.load())
+                        return;
+
+                    if (!destination->captureReady.load())
+                        allReady = false;
+                }
+
+                if (allReady)
+                    return;
+
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    std::wcerr
+                        << L"Some destinations are still connecting; starting capture anyway.\n";
+                    return;
+                }
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(5));
+            }
+        };
+
+        // 启动/重建的统一流程：先把所有目标的 HTTP 连上，再开采集。
+        const auto startEverything = [&]() -> bool {
+            for (const auto& destination : destinations) {
+                destination->captureReady.store(false);
+                destination->captureGaveUp.store(false);
+                destination->stop.store(false);
+                destination->reconnectRequested.store(false);
+                destination->captureDropActive = false;
+                destination->queueTrimActive = false;
+                clearSendQueue(*destination);
+            }
+
+            startSenderThreads();
+
+            // 采集还没 Start，各路队列里不会有数据；
+            // 发送线程连上后只会空转，不会把音频提前灌进去。
+            waitForAllDestinationsConnected();
+
+            if (g_stop.load())
+                return false;
+
+            if (!startAudioCapture()) {
+                // 采集起不来，别把发送线程留成孤儿线程。
+                for (const auto& destination : destinations)
+                    destination->stop.store(true);
+                for (auto& thread : senderThreads) {
+                    if (thread.joinable())
+                        thread.join();
+                }
+                senderThreads.clear();
+                return false;
+            }
+
+            startCaptureThread();
+            return true;
+        };
+
         // 按回车：整套重来一遍。
         // 停采集线程和所有发送线程 -> 重新读取当前默认输出设备并重建 loopback
-        // -> 重新 Start -> 所有目标重新连接。
+        // -> 所有目标重新连接 -> 全部连上后再 Start。
         // 这样在系统里切换了默认播放设备之后，按一下回车就能跟上，
-        // 不必重启程序。
+        // 也不必重启程序。
         const auto rebuildAll = [&]() {
             captureStop.store(true);
             if (captureThread.joinable())
@@ -2606,7 +2701,7 @@ int wmain(int argc, wchar_t* argv[])
                 if (g_stop.load())
                     return;
 
-                if (openCapture() && startAudioCapture())
+                if (openCapture())
                     break;
 
                 std::wcerr
@@ -2614,30 +2709,17 @@ int wmain(int argc, wchar_t* argv[])
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            for (const auto& destination : destinations) {
-                destination->stop.store(false);
-                destination->reconnectRequested.store(false);
-                destination->captureDropActive = false;
-                destination->queueTrimActive = false;
-                clearSendQueue(*destination);
-            }
-
-            startSenderThreads();
-            startCaptureThread();
+            if (!startEverything())
+                return;
 
             std::wcout
                 << L"Reconnect requested for all destinations.\n";
         };
 
-        // 先启动发送线程，再启动采集；避免刚启动时队列短暂无人消费。
-        startSenderThreads();
-
-        if (!startAudioCapture()) {
+        if (!startEverything()) {
             stopThreads();
             return false;
         }
-
-        startCaptureThread();
 
         std::wcout
             << L"Press Enter to reconnect all, Ctrl+C to stop.\n";
