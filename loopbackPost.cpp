@@ -8,6 +8,7 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <ksmedia.h>
+#include <timeapi.h>
 #include <winhttp.h>
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "winmm.lib")
 
 static std::atomic_bool g_stop{false};
 static std::atomic_uint g_volumeUpRequests{0};
@@ -62,19 +64,19 @@ struct WriteStats {
 // 一旦明显超出就说明链路或进程卡了，必须丢。
 static double kDropBacklogMs = 20.0;
 
-// 发送水位（毫秒）：队列里攒够这么多音频才写出去。
-// 调大就等于额外增加延迟，用来吸收网络抖动，让播放更稳；
-// 代价是端到端延迟变大，多设备同步时也能用更大的缓冲。
-static double kSendWaterMs = 5.0;
+// 第二个参数：额外延迟（毫秒），同时也是发送端抖动缓冲的目标深度。
+// 0 表示只保留一个发送块（5ms）的最小缓冲，不额外增加延迟。
+// 大于 0 时，发送线程会先等缓冲区里出现一块音频，再额外等这么久才开始发送，
+// 之后一直维持这么多音频在缓冲区里，相当于一个真正的抖动缓冲。
+static double kExtraDelayMs = 0.0;
 
 // 队列硬上限（毫秒音频），只用来兜住服务端彻底卡死的病态情况。
 static double kDropAllBacklogMs = 500.0;
 
-// 发送节拍：采集到的音频先入发送队列，再由发送循环每 kSendChunkMs 写一块。
-// 以前是“来一个 WASAPI 包就写一次”，socket 发送缓冲一满写调用就阻塞，
-// 阻塞期间采集侧继续积压，socket 一空又把积压一次性灌进去，
-// 于是内核发送缓冲里常年堆着 100~300ms 的音频，那才是延迟主体。
-static double kSendChunkMs = 10.0;
+// 发送块/发送节拍（毫秒）：攒够一块就按固定节拍一块一块写出去，
+// 不再“来多少发多少”。5ms 一块、5ms 一次，对 Wi-Fi 更友好；
+// 以前一次 10ms 甚至一次灌一大块，会让包又大又稀。
+static double kSendChunkMs = 5.0;
 
 // HTTP/网络重连最多自动尝试 3 次；只有真正写出音频数据后才清零。
 static constexpr int kMaxAutoReconnectAttempts = 3;
@@ -260,6 +262,27 @@ static void PrintHr(const wchar_t* where, HRESULT hr)
     std::wcerr << where << L" failed, HRESULT=0x"
                << std::hex << static_cast<unsigned long>(hr) << std::dec << L"\n";
 }
+
+// 发送节拍是 5ms 级的，而 Windows 默认的 Sleep 精度可能只有 15.6ms。
+// 进程内申请 1ms 定时器精度，保证发送线程能按 5ms 一块的节奏醒来。
+struct TimerResolutionGuard {
+    TimerResolutionGuard()
+    {
+        active = timeBeginPeriod(1) == TIMERR_NOERROR;
+        if (!active) {
+            std::wcerr
+                << L"timeBeginPeriod(1) failed; send pacing may be imprecise.\n";
+        }
+    }
+
+    ~TimerResolutionGuard()
+    {
+        if (active)
+            timeEndPeriod(1);
+    }
+
+    bool active = false;
+};
 
 // 实现媒体按键音量键的拦截,实际控制音箱的音量
 static LRESULT CALLBACK LowLevelKeyboardProc(int code,
@@ -496,7 +519,7 @@ struct Destination {
     size_t sendChunkBytes = 0;
     double sendBytesPerMs = 0.0;
     size_t maxQueuedBytes = 0;
-    size_t minSendBytes = 0;
+    size_t targetQueuedBytes = 0;
 };
 
 static void ConfigureDestination(Destination& destination,
@@ -522,11 +545,16 @@ static void ConfigureDestination(Destination& destination,
     destination.maxQueuedBytes = std::max<size_t>(
         destination.sendChunkBytes * 8,
         static_cast<size_t>(
-            destination.sendBytesPerMs * kDropAllBacklogMs));
-    destination.minSendBytes = std::max<size_t>(
-        1,
+            destination.sendBytesPerMs *
+            std::max(kDropAllBacklogMs,
+                     kExtraDelayMs + kSendChunkMs + 100.0)));
+    // 发送前队列至少要保有“额外延迟 + 一块”的音频。
+    // 这样即使声卡实际采样率和墙钟有细微偏差，缓冲也只会变多、不会慢慢漏光。
+    destination.targetQueuedBytes = std::max<size_t>(
+        destination.sendChunkBytes,
         static_cast<size_t>(
-            destination.sendBytesPerMs * kSendWaterMs));
+            destination.sendBytesPerMs *
+            (kExtraDelayMs + kSendChunkMs)));
 }
 
 static std::wstring TrimSpec(const std::wstring& text)
@@ -1326,6 +1354,9 @@ static bool ConvertToS16(
 
 int wmain(int argc, wchar_t* argv[])
 {
+    // 发送线程按 5ms 节拍工作，先确保 Sleep 精度足够。
+    TimerResolutionGuard timerResolution;
+
     // 设置成高优先级
     if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS))
         PrintWinError(L"SetPriorityClass(HIGH_PRIORITY_CLASS)");
@@ -1343,22 +1374,29 @@ int wmain(int argc, wchar_t* argv[])
 
     // 命令行参数：
     //   argv[1] 目标地址，可用半角逗号分隔多个；L/R 前缀表示只发左/右声道
-    //   argv[2] 发送水位 ms（多攒这么多音频才发，等于额外增加延迟）
+    //   argv[2] 额外延迟 ms（抖动缓冲深度；0 = 不额外延迟）
     //   argv[3] 允许的最大音频年龄 ms，超过就丢旧音频
     //   argv[4] 队列硬上限 ms（兜底，正常不该触发）
 
     if (argc >= 3) {
-        kSendWaterMs = std::wcstod(argv[2], nullptr);
-        if (kSendWaterMs < 0.0)
-            kSendWaterMs = 0.0;
+        kExtraDelayMs = std::wcstod(argv[2], nullptr);
+        if (!std::isfinite(kExtraDelayMs) || kExtraDelayMs < 0.0)
+            kExtraDelayMs = 0.0;
+        else if (kExtraDelayMs > 60000.0)
+            kExtraDelayMs = 60000.0;
     }
 
     if (argc >= 4) {
         kDropBacklogMs = std::wcstod(argv[3], nullptr);
+        if (!std::isfinite(kDropBacklogMs) || kDropBacklogMs < 0.0)
+            kDropBacklogMs = 20.0;
     }
 
     if (argc >= 5) {
         kDropAllBacklogMs = std::wcstod(argv[4], nullptr);
+        if (!std::isfinite(kDropAllBacklogMs) ||
+            kDropAllBacklogMs < 0.0)
+            kDropAllBacklogMs = 500.0;
     }
 
     if (input.empty()) {
@@ -1637,9 +1675,11 @@ int wmain(int argc, wchar_t* argv[])
         }
 
         std::wcout
-            << L"Send watermark: " << kSendWaterMs
-            << L" ms (extra latency), drop above "
-            << std::max(kDropBacklogMs, kSendWaterMs + 10.0)
+            << L"Jitter buffer: " << kExtraDelayMs
+            << L" ms extra delay, " << kSendChunkMs
+            << L" ms chunks; drop above "
+            << std::max(kDropBacklogMs,
+                        kExtraDelayMs + kSendChunkMs + 10.0)
             << L" ms\n";
 
         if (!StartKeyboardHook()) {
@@ -1658,8 +1698,11 @@ int wmain(int argc, wchar_t* argv[])
             }
         });
 
+        // 抖动缓冲深度要算进“允许的最大音频年龄”里，否则刚攒到目标深度，
+        // 队头音频就会被当成过期数据丢掉，第二个参数就永远加不出延迟。
         const double effectiveDropMs =
-            std::max(kDropBacklogMs, kSendWaterMs + 10.0);
+            std::max(kDropBacklogMs,
+                     kExtraDelayMs + kSendChunkMs + 10.0);
 
         // 把 WASAPI 时间戳换算成“这段音频现在有多旧”（毫秒）。
         // 返回值已经扣掉校准偏移；偏移尚未建立时返回 0（不丢）。
@@ -2081,6 +2124,30 @@ int wmain(int argc, wchar_t* argv[])
             auto lastDiagTime = std::chrono::steady_clock::now();
             size_t diagSentBytes = 0;
 
+            // 发送状态：连接/重连成功后先进入“预填充”，
+            // 等队列里出现一块音频，再额外等 kExtraDelayMs，
+            // 然后才按固定的块时长一块一块发送。
+            bool streaming = false;
+            bool primeAudioSeen = false;
+            std::chrono::steady_clock::time_point primeDeadline{};
+            std::chrono::steady_clock::time_point nextSendTime{};
+
+            const auto extraDelay = std::chrono::nanoseconds(
+                static_cast<long long>(
+                    std::llround(kExtraDelayMs * 1000000.0)));
+
+            // 节拍按“这一块实际代表多少音频”算，而不是写死 5ms：
+            // 44.1kHz 下一块 220 帧只有 4.9887ms，按 5ms 发会越攒越多，
+            // 最后触发过期丢弃，每隔一段时间就丢一块。
+            const double sendIntervalMs =
+                destination.sendBytesPerMs > 0.0
+                    ? static_cast<double>(destination.sendChunkBytes) /
+                          destination.sendBytesPerMs
+                    : kSendChunkMs;
+            const auto sendInterval = std::chrono::nanoseconds(
+                static_cast<long long>(
+                    std::llround(sendIntervalMs * 1000000.0)));
+
             const auto publishActiveParts = [&]() {
                 std::lock_guard<std::mutex> lock(
                     destination.partsMutex);
@@ -2207,6 +2274,8 @@ int wmain(int argc, wchar_t* argv[])
             const auto markDisconnected = [&]() {
                 connected = false;
                 streamConfirmed = false;
+                streaming = false;
+                primeAudioSeen = false;
             };
 
             while (!g_stop.load() && !destination.stop.load()) {
@@ -2314,6 +2383,9 @@ int wmain(int argc, wchar_t* argv[])
                     successfulChunks = 0;
                     everConnected = true;
                     clearSendQueue(destination);
+                    // 新连接从零开始预填充抖动缓冲，重连后也一样。
+                    streaming = false;
+                    primeAudioSeen = false;
                     lastDiagTime = std::chrono::steady_clock::now();
                     diagSentBytes = 0;
 
@@ -2333,8 +2405,70 @@ int wmain(int argc, wchar_t* argv[])
                 }
 
                 std::vector<BYTE> block;
-                if (readyBytes >= destination.minSendBytes)
-                    block = takeSendBlock(destination);
+
+                // 连接/重连成功后的预填充：
+                // 先等缓冲区里真正出现一块音频（5ms），从这一刻开始计时，
+                // 再等第二个参数设置的时长，然后才进入按节拍发送的状态。
+                // 这段时间采集一直在往队列里写，所以开始发送时队列里
+                // 正好压着“额外延迟 + 一块”的音频，相当于抖动缓冲。
+                if (connected && !streaming) {
+                    const auto now = std::chrono::steady_clock::now();
+
+                    if (!primeAudioSeen) {
+                        if (readyBytes >= destination.sendChunkBytes) {
+                            primeAudioSeen = true;
+                            primeDeadline = now + extraDelay;
+
+                            if (kExtraDelayMs > 0.0) {
+                                std::wcout
+                                    << L"[dest "
+                                    << (destination.index + 1)
+                                    << L"] Audio started; holding "
+                                    << static_cast<long long>(
+                                           kExtraDelayMs)
+                                    << L" ms jitter buffer...\n";
+                            }
+                        }
+                    } else if (now >= primeDeadline) {
+                        if (readyBytes >= destination.sendChunkBytes) {
+                            streaming = true;
+                            nextSendTime = now;
+
+                            std::wcout
+                                << L"[dest "
+                                << (destination.index + 1)
+                                << L"] Jitter buffer primed at "
+                                << static_cast<long long>(
+                                       static_cast<double>(readyBytes) /
+                                       destination.sendBytesPerMs)
+                                << L" ms; streaming in "
+                                << static_cast<long long>(kSendChunkMs)
+                                << L" ms chunks.\n";
+                        } else {
+                            // 计时结束时缓冲又空了（例如采集刚恢复）：
+                            // 重新等一块音频再开始计时，避免空缓冲起跑。
+                            primeAudioSeen = false;
+                        }
+                    }
+                }
+
+                if (connected && streaming) {
+                    const auto now = std::chrono::steady_clock::now();
+
+                    // 目标水位 + 固定节拍：只有队列里还保有设定的延迟量、
+                    // 并且到了下一块的时间点才发，避免把抖动缓冲本身发空。
+                    if (now >= nextSendTime &&
+                        readyBytes >= destination.targetQueuedBytes) {
+                        block = takeSendBlock(destination);
+
+                        // 固定节拍：落后时重新对齐到下一个节拍，绝不补发突发。
+                        // 补发会把音频一次性塞进内核发送缓冲，包又大又密，
+                        // 反而让延迟越滚越大；积压交给上面的过期丢弃去处理。
+                        nextSendTime += sendInterval;
+                        if (nextSendTime <= now)
+                            nextSendTime = now + sendInterval;
+                    }
+                }
 
                 if (!block.empty()) {
                     if (!WritePcm(
