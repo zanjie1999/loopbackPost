@@ -90,8 +90,8 @@ static constexpr auto kCongestionReconnectDelay = std::chrono::milliseconds(200)
 // 各路建流速度不同，先连上的那一路会多收几百毫秒音频，
 // 两台设备之间就留下一个固定的初始偏移，之后再也追不回来。
 // 等全部连上再统一 Start，各路从同一时刻开始收数据，初始偏移就没了。
-// 但只要有目标彻底放弃（等待回车/服务模式退避），就不该让其他路跟着没声音，
-// 所以最多等这么久就先开采集。
+// 这个超时只用来“不再等剩下的路”，前提是已经有一路连上了；
+// 一路都没连上时不会开采集，否则就是往没人收的队列里灌音频。
 static constexpr auto kCaptureGateTimeout = std::chrono::milliseconds(3000);
 
 // 全部连上后再静置一小会儿才开采集。
@@ -2065,6 +2065,10 @@ int wmain(int argc, wchar_t* argv[])
             WriteStats stats;
 
             bool hasStreamedSuccessfully = false;
+            // 这条 URL 是否成功完成过一次 HTTP 握手。
+            // 端口回退只对“连不上”有意义；已经握手成功过还去换端口，
+            // 等于因为服务端播放器挂了就把唯一正确的地址丢掉。
+            bool everConnected = false;
             bool connected = false;
             bool streamConfirmed = false;
             int successfulChunks = 0;
@@ -2172,6 +2176,7 @@ int wmain(int argc, wchar_t* argv[])
                     closeHttp();
 
                     if (!hasStreamedSuccessfully &&
+                        !everConnected &&
                         IsConnectionFailure(failureError) &&
                         AdvancePortFallback(activeParts)) {
                         publishActiveParts();
@@ -2307,6 +2312,7 @@ int wmain(int argc, wchar_t* argv[])
                     stats = WriteStats{};
                     streamConfirmed = false;
                     successfulChunks = 0;
+                    everConnected = true;
                     clearSendQueue(destination);
                     lastDiagTime = std::chrono::steady_clock::now();
                     diagSentBytes = 0;
@@ -2514,6 +2520,7 @@ int wmain(int argc, wchar_t* argv[])
                                         << L"\n";
                                 } else if (
                                     !hasStreamedSuccessfully &&
+                                    !everConnected &&
                                     AdvancePortFallback(
                                         activeParts)) {
                                     portFallbackApplied = true;
@@ -2530,6 +2537,7 @@ int wmain(int argc, wchar_t* argv[])
                     }
 
                     if (!hasStreamedSuccessfully &&
+                        !everConnected &&
                         !portFallbackApplied &&
                         IsConnectionFailure(
                             stats.lastWinHttpError) &&
@@ -2610,18 +2618,64 @@ int wmain(int argc, wchar_t* argv[])
         // 等所有目标都连上再开采集，让各路从同一时刻开始收数据。
         // 一路建流快、一路慢，如果采集先跑起来，先连上的那路会多吃一段音频，
         // 两台设备之间就永久差这么多，后面无论怎么丢包都追不回来。
-        // 只要有一路彻底放弃（等回车/服务模式退避），就不再等它，先让其余路出声；
-        // 另外最多等 kCaptureGateTimeout，避免服务端慢到把整条链路拖死。
+        //
+        // 超时和“某一路放弃”只放宽“等所有路”，绝不放宽“至少有一路”。
+        // 一路都没连上就开采集，等于把音频往没人收的队列里灌：队头一直被当陈旧
+        // 音频丢掉、日志刷屏，而设备那边一个字节都收不到。这种情况必须一直等，
+        // 直到某一路真正连上为止。
+        const auto anyDestinationReady = [&]() {
+            for (const auto& destination : destinations) {
+                if (destination->captureReady.load())
+                    return true;
+            }
+            return false;
+        };
+
+        // 等待期间仍然响应回车/静音键和音量键：一路都没连上时不能开采集，
+        // 但也不能因此把控制台卡死，否则用户连重试的机会都没有。
+        const auto pollConsoleWhileWaiting = [&]() {
+            bool reconnect = g_reconnectRequested.exchange(false);
+
+            while (_kbhit()) {
+                const int key = _getch();
+
+                if (key == 0 || key == 224) {
+                    const int arrow = _getch();
+
+                    if (arrow == 72) {
+                        ++g_volumeUpRequests;
+                    } else if (arrow == 80) {
+                        ++g_volumeDownRequests;
+                    }
+                } else if (key == '\r') {
+                    reconnect = true;
+                }
+            }
+
+            if (reconnect) {
+                std::wcout
+                    << L"Reconnecting all destinations.\n";
+
+                for (const auto& destination : destinations) {
+                    destination->captureGaveUp.store(false);
+                    destination->reconnectRequested.store(true);
+                }
+            }
+        };
+
         const auto waitForAllDestinationsConnected = [&]() {
             const auto deadline =
                 std::chrono::steady_clock::now() + kCaptureGateTimeout;
+            bool warnedNoLink = false;
+            bool warnedPartial = false;
 
             while (!g_stop.load()) {
                 bool allReady = true;
+                bool gaveUp = false;
 
                 for (const auto& destination : destinations) {
                     if (destination->captureGaveUp.load())
-                        return;
+                        gaveUp = true;
 
                     if (!destination->captureReady.load())
                         allReady = false;
@@ -2630,14 +2684,31 @@ int wmain(int argc, wchar_t* argv[])
                 if (allReady)
                     return;
 
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    std::wcerr
-                        << L"Some destinations are still connecting; starting capture anyway.\n";
+                const bool deadlineReached =
+                    std::chrono::steady_clock::now() >= deadline;
+                const bool anyReady = anyDestinationReady();
+
+                // 只要有任意一路已经连上，就不该让其余路拖着它没声音。
+                if (anyReady && (deadlineReached || gaveUp)) {
+                    if (!warnedPartial) {
+                        std::wcerr
+                            << L"Not every destination is connected; starting capture for the connected ones.\n";
+                        warnedPartial = true;
+                    }
                     return;
                 }
 
+                // 一路都没连上：继续等，别对着空气采集。
+                if (!anyReady && !warnedNoLink) {
+                    std::wcerr
+                        << L"No destination connected yet; holding capture until the first one connects (press Enter to retry).\n";
+                    warnedNoLink = true;
+                }
+
+                pollConsoleWhileWaiting();
+
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(5));
+                    std::chrono::milliseconds(20));
             }
         };
 
