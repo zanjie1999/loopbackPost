@@ -473,6 +473,7 @@ struct UrlParts {
     INTERNET_PORT port = 0;
     bool https = false;
     bool portSpecified = false;
+    bool portLocked = false;
 };
 
 // 一路目标：普通立体声，或只发送左/右声道。
@@ -672,6 +673,10 @@ static bool IsConnectionFailure(DWORD error) {
 }
 
 static bool AdvancePortFallback(UrlParts& parts) {
+    if (parts.portLocked) {
+        return false;
+    }
+
     if (parts.https) {
         return false;
     }
@@ -2107,14 +2112,12 @@ int wmain(int argc, wchar_t* argv[])
             HINTERNET request = nullptr;
             WriteStats stats;
 
-            bool hasStreamedSuccessfully = false;
-            // 这条 URL 是否成功完成过一次 HTTP 握手。
-            // 端口回退只对“连不上”有意义；已经握手成功过还去换端口，
-            // 等于因为服务端播放器挂了就把唯一正确的地址丢掉。
-            bool everConnected = false;
             bool connected = false;
             bool streamConfirmed = false;
             int successfulChunks = 0;
+            // 连接成功的时间点。连续成功 10 秒后锁定端口，
+            // 之后网络原因断连重连也不会再自动切换端口。
+            std::chrono::steady_clock::time_point connectedSince{};
             int autoReconnectAttempts = 0;
             bool retryAfterDelay = false;
             bool serviceRetryDelay = false;
@@ -2242,9 +2245,7 @@ int wmain(int argc, wchar_t* argv[])
 
                     closeHttp();
 
-                    if (!hasStreamedSuccessfully &&
-                        !everConnected &&
-                        IsConnectionFailure(failureError) &&
+                    if (IsConnectionFailure(failureError) &&
                         AdvancePortFallback(activeParts)) {
                         publishActiveParts();
                         std::wcout
@@ -2381,7 +2382,7 @@ int wmain(int argc, wchar_t* argv[])
                     stats = WriteStats{};
                     streamConfirmed = false;
                     successfulChunks = 0;
-                    everConnected = true;
+                    connectedSince = std::chrono::steady_clock::now();
                     clearSendQueue(destination);
                     // 新连接从零开始预填充抖动缓冲，重连后也一样。
                     streaming = false;
@@ -2395,6 +2396,13 @@ int wmain(int argc, wchar_t* argv[])
                     std::wcout
                         << L"[dest " << (destination.index + 1)
                         << L"] HTTP connected; waiting for audio writes...\n";
+                }
+
+                if (connected && !activeParts.portLocked &&
+                    std::chrono::steady_clock::now() - connectedSince >=
+                        std::chrono::seconds(10)) {
+                    activeParts.portLocked = true;
+                    publishActiveParts();
                 }
 
                 size_t readyBytes = 0;
@@ -2483,7 +2491,6 @@ int wmain(int argc, wchar_t* argv[])
                         if (!streamConfirmed &&
                             successfulChunks >= 3) {
                             streamConfirmed = true;
-                            hasStreamedSuccessfully = true;
                             autoReconnectAttempts = 0;
                             serviceRetryDelay = false;
                             retryAfterDelay = false;
@@ -2637,6 +2644,8 @@ int wmain(int argc, wchar_t* argv[])
                                         L"channels",
                                         std::to_wstring(
                                             outChannels));
+                                    redirected.portLocked =
+                                        activeParts.portLocked;
                                     activeParts = redirected;
                                     publishActiveParts();
 
@@ -2653,8 +2662,6 @@ int wmain(int argc, wchar_t* argv[])
                                         << activeParts.path
                                         << L"\n";
                                 } else if (
-                                    !hasStreamedSuccessfully &&
-                                    !everConnected &&
                                     AdvancePortFallback(
                                         activeParts)) {
                                     portFallbackApplied = true;
@@ -2670,9 +2677,7 @@ int wmain(int argc, wchar_t* argv[])
                         }
                     }
 
-                    if (!hasStreamedSuccessfully &&
-                        !everConnected &&
-                        !portFallbackApplied &&
+                    if (!portFallbackApplied &&
                         IsConnectionFailure(
                             stats.lastWinHttpError) &&
                         AdvancePortFallback(activeParts)) {
